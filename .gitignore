@@ -1,0 +1,14 @@
+build/
+builds/
+.vscode/
+.cache/
+CMakeUserPresets.json
+*.user
+*.suo
+*.VC.db
+
+# third-party dependency: fetched by CMake (FetchContent, JUCE 8.0.4)
+JUCE-8.0.4/
+
+# local tooling config
+.kilo/
