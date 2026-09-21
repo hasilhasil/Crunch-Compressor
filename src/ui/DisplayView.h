@@ -8,52 +8,9 @@
 #include "../PluginProcessor.h"
 #include "LookAndFeel.h"
 
-// Settings (gear) button drawn as a vector icon: the embedded Poppins
-// typeface has no gear glyph, and a hand-drawn icon keeps the rounded-pill
-// look consistent with the rest of the widgets.
-class GearButton : public juce::Button
-{
-public:
-    GearButton() : juce::Button ("Settings") {}
-
-    void paintButton (juce::Graphics& g, bool shouldDrawButtonAsHighlighted,
-                      bool shouldDrawButtonAsDown) override
-    {
-        const bool light = isLightTheme();
-
-        auto bounds = getLocalBounds().toFloat().reduced (0.5f);
-        const float corner = juce::jmin (14.0f, bounds.getHeight() * 0.5f);
-        auto bg = CrunchPalette::track (light);
-        if (shouldDrawButtonAsDown)
-            bg = bg.brighter (0.12f);
-        else if (shouldDrawButtonAsHighlighted)
-            bg = bg.brighter (0.06f);
-        g.setColour (bg);
-        g.fillRoundedRectangle (bounds, corner);
-
-        const auto c = getLocalBounds().toFloat().getCentre();
-        const float r = 5.0f;
-        g.setColour (CrunchPalette::text (light));
-        for (int i = 0; i < 8; ++i)
-        {
-            const float a = (float) i * juce::MathConstants<float>::twoPi / 8.0f;
-            juce::Path spoke;
-            spoke.startNewSubPath (c.x + (r - 1.0f) * std::cos (a), c.y + (r - 1.0f) * std::sin (a));
-            spoke.lineTo (c.x + (r + 3.0f) * std::cos (a), c.y + (r + 3.0f) * std::sin (a));
-            g.strokePath (spoke, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved,
-                                                       juce::PathStrokeType::rounded));
-        }
-        g.drawEllipse (c.x - r, c.y - r, r * 2.0f, r * 2.0f, 2.0f);
-    }
-
-private:
-    bool isLightTheme() const
-    {
-        if (auto* laf = dynamic_cast<CrunchLookAndFeel*> (&getLookAndFeel()))
-            return laf->isLightTheme();
-        return true;
-    }
-};
+// Settings (gear) button: a plain juce::TextButton whose text is the gear
+// character U+2699, drawn by CrunchLookAndFeel::drawButtonBackground so it gets
+// exactly the same rounded-pill treatment as the Crunch EQ plugin's button.
 
 // Upper display, Pro-C style:
 //  - top strip: red gain-reduction curve (compression amount over time)
@@ -245,7 +202,7 @@ private:
     void updatePeakHold (float& peakDb, juce::uint32& holdUntilMs,
                          float levelDb, juce::uint32 nowMs, double dt);
 
-    GearButton settingsButton_;
+    juce::TextButton settingsButton_;
     juce::TextButton kneeButton_;
     juce::Label kneeLabel_;
 

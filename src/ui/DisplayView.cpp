@@ -11,6 +11,7 @@ DisplayView::DisplayView (CrunchCompressorAudioProcessor& processor)
     histGr_.resize ((size_t) kHistoryReadPoints);
 
     addAndMakeVisible (settingsButton_);
+    settingsButton_.setButtonText (juce::CharPointer_UTF8 ("\xe2\x9a\x99"));
     settingsButton_.setTooltip ("Settings");
     settingsButton_.onClick = [this] { showSettingsMenu(); };
 
@@ -232,22 +233,48 @@ void DisplayView::drawHistoryGraph (juce::Graphics& g)
     const float h = (float) getHeight();
     const float endOffset = historyEndOffset();
 
-    // input level area (grey, filled to the bottom). Decimated to one point
-    // per pixel column (max inside each column): identical look, ~12x less
-    // path work, and no Path copy for the fill.
-    juce::Path inFill;
-    appendDecimated (inFill, histIn_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
+    // Layer 1: the INPUT level, styled like the Crunch EQ's grey spectrum layer
+    // (inputFill gradient fill + a 1 px outline). Signal source unchanged: the
+    // input peak history.
+    juce::Path inCurve;
+    appendDecimated (inCurve, histIn_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
+
+    const auto grey = CrunchPalette::inputFill (light);
+    juce::ColourGradient greyGrad (grey.withAlpha (0.42f), 0.0f, 0.0f,
+                                   grey.withAlpha (0.08f), 0.0f, h, false);
+    g.setGradientFill (greyGrad);
+
+    juce::Path inFill (inCurve);
     inFill.lineTo (plotW, h);
     inFill.lineTo (0.0f, h);
     inFill.closeSubPath();
-    g.setColour (CrunchPalette::inputFill (light).withAlpha (0.45f));
     g.fillPath (inFill);
 
-    // output level line (light)
-    juce::Path outPath;
-    appendDecimated (outPath, histOut_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
-    g.setColour (CrunchPalette::outputLevel (light));
-    g.strokePath (outPath, juce::PathStrokeType (1.6f));
+    g.setColour (grey.withAlpha (0.55f));
+    g.strokePath (inCurve, juce::PathStrokeType (1.0f));
+
+    // Layer 2: the OUTPUT level, styled like the Crunch EQ's accent spectrum
+    // layer (theme accent gradient fill + the 2 px white outline). Signal source
+    // unchanged: the output peak history. It sits on top of the input layer, so
+    // make-up gain shows as accent sticking out of the grey, and compression
+    // shows as grey sticking out of the accent.
+    juce::Path outCurve;
+    appendDecimated (outCurve, histOut_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
+
+    const auto accent = accentColour();
+    juce::ColourGradient accentGrad (accent.withAlpha (0.65f), 0.0f, 0.0f,
+                                     accent.withAlpha (0.10f), 0.0f, h, false);
+    g.setGradientFill (accentGrad);
+
+    juce::Path outFill (outCurve);
+    outFill.lineTo (plotW, h);
+    outFill.lineTo (0.0f, h);
+    outFill.closeSubPath();
+    g.fillPath (outFill);
+
+    // white outline of the output layer
+    g.setColour (juce::Colours::white.withAlpha (0.95f));
+    g.strokePath (outCurve, juce::PathStrokeType (2.0f));
 }
 
 // Red gain-reduction curve: shows the amount of compression over time on the
