@@ -71,6 +71,11 @@ float DisplayView::dbToX (float db) const
     return (d - kGraphBottomDb) / (kGraphTopDb - kGraphBottomDb) * (float) plotWidth();
 }
 
+juce::Colour DisplayView::accentColour() const
+{
+    return processor_.getThemeAccent();
+}
+
 int DisplayView::plotWidth() const
 {
     return juce::jmax (1, getWidth() - kMeterWidth);
@@ -128,7 +133,35 @@ void DisplayView::timerCallback()
     meterInDbLabel_  = meterInDb_;
     meterOutDbLabel_ = meterOutDb_;
 
+    // Peak-hold for the top strokes (ported from the Crunch EQ plugin). dt is
+    // measured so the fall rate does not depend on the timer rate.
+    const auto nowMs = juce::Time::getMillisecondCounter();
+    const double dtMeter = (lastMeterMs_ == 0)
+                            ? 1.0 / 60.0
+                            : juce::jlimit (0.001, 0.100, (double) (nowMs - lastMeterMs_) / 1000.0);
+    lastMeterMs_ = nowMs;
+
+    updatePeakHold (peakInDb_,  peakInHoldUntilMs_,  inDb,  nowMs, dtMeter);
+    updatePeakHold (peakOutDb_, peakOutHoldUntilMs_, outDb, nowMs, dtMeter);
+
     repaint();
+}
+
+void DisplayView::updatePeakHold (float& peakDb, juce::uint32& holdUntilMs,
+                                  float levelDb, juce::uint32 nowMs, double dt)
+{
+    if (levelDb >= peakDb)
+    {
+        // New peak: snap up and (re)start the hold.
+        peakDb = levelDb;
+        holdUntilMs = nowMs + (juce::uint32) kPeakHoldMs;
+    }
+    else if (nowMs >= holdUntilMs)
+    {
+        // Hold expired: fall back towards the current level, never below it, so
+        // the stroke always sits on top of the bar.
+        peakDb = juce::jmax (levelDb, peakDb - (float) (kPeakFallDbPerSec * dt));
+    }
 }
 
 float DisplayView::historyEndOffset() const
@@ -338,37 +371,37 @@ void DisplayView::drawMeters (juce::Graphics& g)
         return (1.0f - frac) * h;
     };
 
-    const auto drawMeter = [&] (int x, int w, float db, const juce::String& label,
-                                const juce::String& dbText, bool gradient)
+    // Meters. Same style as the Crunch EQ plugin: the IN bar is a flat colour
+    // wash, the OUT bar is a vertical gradient spanning the full bar height
+    // (theme accent at the top, the theme's "current" colour at the bottom).
+    // The top stroke rides the held peak (peak hold) and is white in the dark
+    // Blue/Red themes so it stands out; in Cream it keeps the grey.
+    const auto drawMeter = [&] (int x, int w, float db, float peakDb,
+                                const juce::String& label, const juce::String& dbText,
+                                juce::Colour col, juce::Colour bottomColour,
+                                juce::Colour capColour, bool gradient)
     {
         g.setColour (CrunchPalette::meterBg (light));
         g.fillRect (x, 0, w, getHeight());
-
-        const float y = meterY (juce::jlimit (minDb, maxDb, db));
-
-        if (gradient)
-        {
-            // full-height green -> yellow -> red gradient, covered above the level
-            juce::ColourGradient grad (juce::Colour (0xffe05b5b), (float) x, 0.0f,
-                                       juce::Colour (0xff3ac36b), (float) x, h, false);
-            grad.addColour (0.5, juce::Colour (0xffe0c02f));
-            g.setGradientFill (grad);
-            g.fillRect (x, 0, w, getHeight());
-            g.setColour (CrunchPalette::meterBg (light));
-            g.fillRect (x, 0, w, (int) y);
-        }
-        else
-        {
-            g.setColour (CrunchPalette::inputFill (light).withAlpha (0.65f));
-            g.fillRect (x, (int) y, w, getHeight() - (int) y);
-        }
 
         g.setColour (CrunchPalette::grid (light));
         for (float dbTick = minDb; dbTick <= 0.0f; dbTick += 12.0f)
             g.drawHorizontalLine ((int) meterY (dbTick), (float) x, (float) (x + w));
 
-        g.setColour (gradient ? juce::Colour (0xff3ac36b) : CrunchPalette::inputFill (light));
-        g.fillRect (x, (int) y, w, 2);
+        const float y  = meterY (juce::jlimit (minDb, maxDb, db));
+        const float py = meterY (juce::jlimit (minDb, maxDb, peakDb));
+
+        if (gradient)
+            g.setGradientFill (juce::ColourGradient (col,          (float) x, 0.0f,
+                                                     bottomColour, (float) x, h, false));
+        else
+            g.setColour (col.withAlpha (0.35f));
+
+        g.fillRect (x, (int) y, w, getHeight() - (int) y);
+
+        // top stroke: the held peak, so short peaks stay visible
+        g.setColour (capColour);
+        g.fillRect (x, (int) py, w, 2);
 
         g.setFont (CrunchLookAndFeel::uiFont (11.0f, 500));
         g.setColour (CrunchPalette::textDim (light));
@@ -378,8 +411,21 @@ void DisplayView::drawMeters (juce::Graphics& g)
         g.drawText (dbText, x, getHeight() - 16, w, 13, juce::Justification::centred, false);
     };
 
-    drawMeter (bar1x, barW, meterInDb_,  "IN",  juce::String (meterInDbLabel_, 1),  false);
-    drawMeter (bar2x, barW, meterOutDb_, "OUT", juce::String (meterOutDbLabel_, 1), true);
+    const juce::Colour accent = accentColour();
+
+    // Cream (light) ends at a darker accent; Blue/Red end at the current OUT
+    // colour so the bar fades towards the tone it used before.
+    const juce::Colour outBottom = light ? accent.darker (0.5f)
+                                         : CrunchPalette::outputLevel (light);
+
+    // Top stroke: white in the dark Blue/Red themes; Cream keeps the grey.
+    const juce::Colour capColour = light ? CrunchPalette::inputFill (light)
+                                         : juce::Colours::white;
+
+    drawMeter (bar1x, barW, meterInDb_,  peakInDb_,  "IN",  juce::String (meterInDbLabel_, 1),
+               CrunchPalette::inputFill (light), CrunchPalette::inputFill (light), capColour, false);
+    drawMeter (bar2x, barW, meterOutDb_, peakOutDb_, "OUT", juce::String (meterOutDbLabel_, 1),
+               accent, outBottom, capColour, true);
 }
 
 void DisplayView::paint (juce::Graphics& g)

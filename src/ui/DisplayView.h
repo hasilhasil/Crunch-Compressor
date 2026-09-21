@@ -88,6 +88,9 @@ private:
     float dbToX (float db) const;
     int   plotWidth() const;
 
+    // Theme accent (same source of truth as the EQ plugin).
+    juce::Colour accentColour() const;
+
     // Top inset reserved for the GR readout / settings button; the level
     // graph starts below it. The GR curve shares the same dB scale as the
     // graph (0 dB at the top inset, -60 dB at the bottom), so its amount can
@@ -227,6 +230,20 @@ private:
     float meterOutDb_ = -120.0f;
     float meterInDbLabel_ = -120.0f;
     float meterOutDbLabel_ = -120.0f;
+
+    // Peak-hold for the meter top strokes, ported from the Crunch EQ plugin:
+    // the stroke rides the peak and holds it for kPeakHoldMs before falling
+    // back, so a short peak stays readable (Pro-Q 3 style). The bar itself
+    // keeps its fast (instant up / 60 dB per second down) ballistics.
+    static constexpr int kPeakHoldMs = 2000;          // 1-3 s, as requested
+    static constexpr float kPeakFallDbPerSec = 30.0f; // after the hold expires
+
+    float peakInDb_  = -120.0f, peakOutDb_  = -120.0f;
+    juce::uint32 peakInHoldUntilMs_ = 0, peakOutHoldUntilMs_ = 0;
+    juce::uint32 lastMeterMs_ = 0;
+
+    void updatePeakHold (float& peakDb, juce::uint32& holdUntilMs,
+                         float levelDb, juce::uint32 nowMs, double dt);
 
     GearButton settingsButton_;
     juce::TextButton kneeButton_;

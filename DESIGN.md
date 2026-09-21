@@ -102,9 +102,23 @@ KNEE 曲线开关。保留：旋钮双击复位（JUCE 内建）、Shift 微调�
 
 ### 2.4 电平表与读数
 
-- 右侧 60px 条带：IN（灰填充，原始输入峰值）、OUT（绿→黄→红竖向渐变）。
-  峰值保持：60 Hz 每 tick 衰减 1 dB，下限 −60 dB；量程固定 −60…+6 dB
-  （`kMeterTopDb/kMeterBottomDb`，与主图 0 dB 顶边的刻度无关，保留余量）。
+- 右侧 60px 条带，样式与 Crunch EQ 完全一致：
+  - IN：`CrunchPalette::inputFill` 平色填充（α 0.35），原始输入峰值。
+  - OUT：整条全高竖向渐变，顶端 = 主题 accent，底端 = 该主题的"当前颜色"
+    （暗色蓝/红主题用 `CrunchPalette::outputLevel`，Cream 主题用
+    `accent.darker(0.5)`）。
+  - **顶部描边（峰值保持）**：描边跟随的是**保持的峰值**而非当前电平——
+    新峰值瞬时跟上并重置 hold 计时；hold `kPeakHoldMs` = 2000 ms（1~3 s 区间取
+    中间值）；到期后按 `kPeakFallDbPerSec` = 30 dB/s 回落，且
+    `jmax(levelDb, …)` 保证永不低于当前电平，因此描边始终在柱条上方。
+    描边颜色：暗色蓝/红主题为纯白（`juce::Colours::white`），Cream 主题为
+    `CrunchPalette::inputFill` 灰。
+  - 柱条本身弹道不变：瞬时上升、60 Hz 每 tick 衰减 1 dB；量程固定 −60…+6 dB
+    （`kMeterTopDb/kMeterBottomDb`，与主图 0 dB 顶边的刻度无关，保留余量）。
+- 峰值保持算法（`DisplayView::updatePeakHold`）与 EQ 插件逐行一致，dt 按真实
+  tick 间隔测量，回落速率不受定时器频率影响；已用离线脚本验证：0 dB→−20 dB
+  时柱 0.4 s 内掉到 −20 dB，描边保持 0.00 dB 整整 2.0 s，之后 30 dB/s 回落，
+  3 s 后收敛到 −20 dB（= 当前电平）。
 - 主图纵轴 0…−60 dB（每 6 dB 一线，0 dB 加粗，左侧每 6 dB 标注），
   纵向每 1/10 宽度一条浅色时间网格；主图顶部为 `topInset()` 内缩。
 
