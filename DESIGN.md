@@ -55,7 +55,9 @@ KNEE 曲线开关。保留：旋钮双击复位（JUCE 内建）、Shift 微调�
   GR = 0 时红线贴在该内缩顶边。
 - 数据来自电平历史的 `histGr_`（压缩器实际施加的增益衰减，旁路时为 0，
   曲线贴顶）。GR 曲线画在电平历史**之后**，避免被半透明输入填充遮住。
-- 右上角另有 `GR x.x dB` 数字读数。
+- 右上角另有 `GR x.x dB` 数字读数（`DisplayView::drawGainReduction`）：字号
+  明显大于显示区其他小字（SemiBold 19px，对比网格标签 10.5px、电平表
+  11/10px），压缩量一眼可读；右对齐并留出顶部内缩条，不与 0 dB 网格线重叠。
 
 ### 2.2 主图：滚动电平历史（约 5 秒窗口）
 
@@ -195,7 +197,7 @@ Input → 输入增益 → [染色(Pre)] → 压缩器 → [染色(Post)] → �
 选择器文字标签（KNEE / DETECTOR / LOOKAHEAD）SemiBold 12.5px 弱化色，
 STYLE 模块名 Bold 15.5px；数值读数在旋钮下方，Poppins 13.5px（经
 `getLabelFont` 统一覆写，同时作用于下拉框文字）。按钮文字 14px
-（`getTextButtonFont`），显示区网格标签 10.5px、GR 读数 12px、
+（`getTextButtonFont`），显示区网格标签 10.5px、GR 读数 SemiBold 19px、
 电平表标签/读数 11/10px。
 - **读数格式**（`Parameters.cpp` 的 `withStringFromValueFunction`）：
   dB 两位小数、ms 在 ≥1 时取整、百分比整数；单位后缀由 slider 追加。

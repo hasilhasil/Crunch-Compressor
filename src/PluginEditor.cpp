@@ -36,10 +36,16 @@ CrunchCompressorAudioProcessorEditor::CrunchCompressorAudioProcessorEditor (Crun
         panel_.repaint();
         repaint();
     };
+
+    // The peer may already exist (standalone / some hosts); otherwise
+    // parentHierarchyChanged() applies this once the host attaches the editor.
+    forceSoftwareRenderer();
 }
 
 CrunchCompressorAudioProcessorEditor::~CrunchCompressorAudioProcessorEditor()
 {
+    stopTimer();
+
     for (auto* param : processor_.getParameters())
     {
         if (auto* idp = dynamic_cast<juce::RangedAudioParameter*> (param))
@@ -58,13 +64,70 @@ void CrunchCompressorAudioProcessorEditor::resized()
 {
     processor_.setEditorSize (getWidth(), getHeight());
 
+    // A resize drag also runs a modal loop that invalidates the window per
+    // step, so the display should stand down for it exactly like a move.
+    noteWindowMove();
+
     auto area = getLocalBounds();
     panel_.setBounds (area.removeFromBottom (280));
     display_.setBounds (area);
 }
 
+// JUCE calls this for every window-position change (WM_WINDOWPOSCHANGED ->
+// handleMovedOrResized -> sendMovedResizedMessages), i.e. once per mouse
+// sample while the user drags the editor window.
+void CrunchCompressorAudioProcessorEditor::moved()
+{
+    noteWindowMove();
+}
+
+void CrunchCompressorAudioProcessorEditor::noteWindowMove()
+{
+    processor_.setWindowDragging (true);
+    lastMoveMs_ = juce::Time::getMillisecondCounter();
+    startTimer (50);   // watches for the end of the drag loop
+}
+
+void CrunchCompressorAudioProcessorEditor::timerCallback()
+{
+    // No move event for a while: the drag loop has finished, so the display
+    // may animate again. The very next display tick repaints everything.
+    if (juce::Time::getMillisecondCounter() - lastMoveMs_ >= 150)
+    {
+        processor_.setWindowDragging (false);
+        stopTimer();
+    }
+}
+
+// Called when the host attaches (or re-attaches) the editor, i.e. exactly when
+// the native peer becomes available. Switching the rendering engine is
+// idempotent, so calling it from here and from the constructor is safe.
+void CrunchCompressorAudioProcessorEditor::parentHierarchyChanged()
+{
+    forceSoftwareRenderer();
+}
+
+void CrunchCompressorAudioProcessorEditor::forceSoftwareRenderer()
+{
+    auto* peer = getPeer();
+    if (peer == nullptr)
+        return;
+
+    const auto engines = peer->getAvailableRenderingEngines();
+    const int software = engines.indexOf (juce::String ("Software Renderer"));
+
+    if (software < 0 || peer->getCurrentRenderingEngine() == software)
+        return;
+
+    peer->setCurrentRenderingEngine (software);
+    repaint();
+}
+
 void CrunchCompressorAudioProcessorEditor::parameterChanged (const juce::String&, float)
 {
+    // The static transfer curve depends on the parameters, so mark it stale
+    // instead of recomputing it on every repaint.
+    display_.parametersChanged();
     display_.repaint();
     panel_.repaint();
 }

@@ -31,8 +31,14 @@ public:
 
     std::function<void()> onThemeChanged;
 
+    // Called by the editor whenever any parameter change was notified: the
+    // static transfer curve is only recomputed when something actually
+    // changed, so a static instance costs nothing per frame.
+    void parametersChanged() { transferDirty_ = true; }
+
 private:
     void drawGrid (juce::Graphics& g);
+    void refreshGridCache();
     void drawHistoryGraph (juce::Graphics& g);
     void drawGrCurve (juce::Graphics& g);
     void drawTransferCurve (juce::Graphics& g);
@@ -182,6 +188,38 @@ private:
     // transfer-curve scratch (members, so no per-frame heap allocation)
     std::vector<float> curveInDb_, curveOutDb_;
 
+    // Per-frame paths as members: juce::Path::clear() keeps the allocated
+    // capacity, so the scrolling history curves rebuild every frame without
+    // touching the allocator once warmed up.
+    juce::Path inCurve_, inFill_, outCurve_, outFill_, grPath_, livePath_;
+
+    // Static transfer-curve geometry, rebuilt only when the parameters (or the
+    // component size) change - never per repaint.
+    juce::Path transferBasePath_;
+    bool  transferDirty_ = true;
+    int   transferBaseW_ = -1, transferBaseH_ = -1;
+
+    // Static grid cache (background, lines, axis labels): the grid and its 11
+    // dB labels only change when the component is resized or the theme
+    // changes, so they are rendered once into an image and blitted instead of
+    // re-shaping text on every animation frame. Opaque ARGB so the blit is a
+    // direct copy under the software renderer (the editor pins the peer to
+    // it, see PluginEditor::forceSoftwareRenderer).
+    juce::Image gridImage_;
+    int   gridCacheW_ = -1, gridCacheH_ = -1;
+    bool  gridCacheLight_ = false;
+
+    // Last painted state, so a tick repaints only when the picture can
+    // actually differ (the graph scrolls / the meters move / the cursor is
+    // still gliding / the GR text changed). A stopped, silent instance
+    // converges to zero repaints instead of redrawing 60x/s.
+    unsigned lastPaintedCounter_ = 0;
+    double   lastPaintedCursor_  = -1.0;
+    float    lastPaintedGr_      = -1000.0f;
+    bool     lastPaintedKnee_    = false;
+    float    lastMeterIn_  = -200.0f, lastMeterOut_  = -200.0f;
+    float    lastPeakIn_   = -200.0f, lastPeakOut_   = -200.0f;
+
     // meter ballistics (peak-hold with 1 dB/tick decay)
     float meterInDb_ = -120.0f;
     float meterOutDb_ = -120.0f;
@@ -205,6 +243,15 @@ private:
     juce::TextButton settingsButton_;
     juce::TextButton kneeButton_;
     juce::Label kneeLabel_;
+
+    // GR readout (top right, the concrete amount of compression, e.g.
+    // "GR 6.3 dB"). It is the number the eye lands on first, so it sits a
+    // few notches above the other small display text (axis labels 10.5 px,
+    // meter labels/readouts 11/10 px) and in SemiBold, which keeps the value
+    // legible at a glance. The reserved strip stays inside topInset(), so the
+    // larger type never collides with the 0 dB grid line underneath it.
+    static constexpr float kGrReadoutFontPx     = 19.0f;
+    static constexpr int   kGrReadoutFontWeight = 600;
 
     static constexpr int   kMeterWidth = 60;
     static constexpr float kGraphTopDb = 0.0f;    // left axis: 0 dB at the top

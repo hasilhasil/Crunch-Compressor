@@ -73,6 +73,15 @@ public:
     juce::Colour getThemeAccent() const;
     bool isLightTheme() const noexcept { return theme_.load() == 2; }
 
+    // True while the editor window is being dragged or resized. Hosts that
+    // move the plugin editor as its own top-level window (FL Studio) send a
+    // window-position change per mouse sample, each of which invalidates the
+    // whole window; combined with the display's own 60 Hz repaints that
+    // saturates the message loop and shows up as stutter and smearing while
+    // dragging. The display suspends its animation repaints while this is set.
+    bool isWindowDragging() const noexcept { return windowDragging_.load(); }
+    void setWindowDragging (bool dragging) noexcept { windowDragging_.store (dragging); }
+
     int getEditorWidth() const noexcept  { return editorWidth_.load(); }
     int getEditorHeight() const noexcept { return editorHeight_.load(); }
     void setEditorSize (int w, int h)    { editorWidth_.store (w); editorHeight_.store (h); }
@@ -110,6 +119,7 @@ private:
     std::atomic<float> outputPeakDb_ { -100.0f };
     std::atomic<float> gainReduction_ { 0.0f };
     std::atomic<int> theme_ { 0 };
+    std::atomic<bool> windowDragging_ { false };
     std::atomic<int> editorWidth_ { 0 };
     std::atomic<int> editorHeight_ { 0 };
 

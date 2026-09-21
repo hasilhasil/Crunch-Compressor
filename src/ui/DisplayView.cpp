@@ -39,6 +39,10 @@ void DisplayView::resized()
     settingsButton_.setBounds (4, 4, 24, 24);
     kneeLabel_.setBounds (plotWidth() - 92, getHeight() / 2 - 27, 92, 13);
     kneeButton_.setBounds (plotWidth() - 92, getHeight() / 2 - 12, 92, 26);
+
+    // Both cached geometries are in component coordinates, so a resize
+    // invalidates them (they are rebuilt lazily on the next paint).
+    transferDirty_ = true;
 }
 
 // Top inset reserved for the GR readout / settings button; the shared dB scale
@@ -84,6 +88,15 @@ int DisplayView::plotWidth() const
 
 void DisplayView::timerCallback()
 {
+    // The editor window is being dragged or resized (FL Studio moves plugin
+    // editors as their own top-level window, one window-position change per
+    // mouse sample). Stand down completely: the OS-driven repaints after each
+    // move own the message loop during a drag, and our animation repaints
+    // would only compete with them. Everything catches up on the first tick
+    // after the drag ends.
+    if (processor_.isWindowDragging())
+        return;
+
     // readHistory returns the exact counter its copy was based on, so the
     // scroll position is aligned to the data instead of to a counter that
     // may have advanced between the two reads (that mismatch shifted the
@@ -145,7 +158,66 @@ void DisplayView::timerCallback()
     updatePeakHold (peakInDb_,  peakInHoldUntilMs_,  inDb,  nowMs, dtMeter);
     updatePeakHold (peakOutDb_, peakOutHoldUntilMs_, outDb, nowMs, dtMeter);
 
-    repaint();
+    // Rebuild the static transfer-curve geometry only when the parameters or
+    // the component size changed. Done here rather than in paint() so the
+    // dirty flag is always consumed - even while the knee curve is hidden.
+    const bool curveRebuilt = transferDirty_ || transferBaseW_ != getWidth() || transferBaseH_ != getHeight();
+    if (curveRebuilt)
+    {
+        const int points = 128;
+        processor_.getTransferCurve (kGraphBottomDb, kGraphTopDb, points,
+                                     curveInDb_, curveOutDb_);
+
+        transferBasePath_.clear();
+        for (int i = 0; i < points; ++i)
+        {
+            const float x = dbToX (curveInDb_[(size_t) i]);
+            const float y = dbToY (curveOutDb_[(size_t) i]);
+            if (i == 0) transferBasePath_.startNewSubPath (x, y);
+            else        transferBasePath_.lineTo (x, y);
+        }
+
+        transferDirty_  = false;
+        transferBaseW_  = getWidth();
+        transferBaseH_ = getHeight();
+    }
+
+    // Repaint only when the picture can actually differ. The graph scrolls
+    // whenever the ring counter advances (audio playing); the cursor keeps
+    // gliding for ~60 ms after the transport stops; the meters decay for
+    // ~1 s. Once everything is static, a stopped instance converges to zero
+    // repaints instead of redrawing the full display 60x/s.
+    const float grNow = processor_.getGainReductionDb();
+    const bool contentChanged = curveRebuilt
+                             || counter != lastPaintedCounter_
+                             || std::abs (scrollCursor_ - lastPaintedCursor_) > 0.01
+                             || kneeButton_.getToggleState() != lastPaintedKnee_
+                             || std::abs (grNow - lastPaintedGr_) > 0.05f;
+
+    const bool metersChanged = std::abs (meterInDb_  - lastMeterIn_)  > 0.01f
+                            || std::abs (meterOutDb_ - lastMeterOut_) > 0.01f
+                            || std::abs (peakInDb_   - lastPeakIn_)   > 0.01f
+                            || std::abs (peakOutDb_  - lastPeakOut_)  > 0.01f;
+
+    if (contentChanged)
+    {
+        lastPaintedCounter_ = counter;
+        lastPaintedCursor_  = scrollCursor_;
+        lastPaintedGr_      = grNow;
+        lastPaintedKnee_    = kneeButton_.getToggleState();
+        repaint();
+    }
+    else if (metersChanged)
+    {
+        // Meters only: repaint just the meter strip instead of the whole
+        // display (grid blit + history fills + curves).
+        repaint (juce::Rectangle<int> (plotWidth(), 0, kMeterWidth, getHeight()));
+    }
+
+    lastMeterIn_  = meterInDb_;
+    lastMeterOut_ = meterOutDb_;
+    lastPeakIn_   = peakInDb_;
+    lastPeakOut_  = peakOutDb_;
 }
 
 void DisplayView::updatePeakHold (float& peakDb, juce::uint32& holdUntilMs,
@@ -222,6 +294,31 @@ void DisplayView::drawGrid (juce::Graphics& g)
     }
 }
 
+void DisplayView::refreshGridCache()
+{
+    const bool light = processor_.isLightTheme();
+
+    if (gridImage_.isValid()
+        && gridCacheW_ == getWidth() && gridCacheH_ == getHeight()
+        && gridCacheLight_ == light)
+        return;
+
+    if (getWidth() <= 0 || getHeight() <= 0)
+        return;
+
+    // Opaque ARGB: drawGrid() fills the background first, so under the
+    // software renderer the per-frame blit is a direct copy.
+    gridImage_ = juce::Image (juce::Image::ARGB, getWidth(), getHeight(), true);
+    {
+        juce::Graphics gi (gridImage_);
+        drawGrid (gi);
+    }
+
+    gridCacheW_ = getWidth();
+    gridCacheH_ = getHeight();
+    gridCacheLight_ = light;
+}
+
 void DisplayView::drawHistoryGraph (juce::Graphics& g)
 {
     const int n = historyPoints_;
@@ -236,45 +333,47 @@ void DisplayView::drawHistoryGraph (juce::Graphics& g)
     // Layer 1: the INPUT level, styled like the Crunch EQ's grey spectrum layer
     // (inputFill gradient fill + a 1 px outline). Signal source unchanged: the
     // input peak history.
-    juce::Path inCurve;
-    appendDecimated (inCurve, histIn_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
+    inCurve_.clear();
+    appendDecimated (inCurve_, histIn_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
 
     const auto grey = CrunchPalette::inputFill (light);
     juce::ColourGradient greyGrad (grey.withAlpha (0.42f), 0.0f, 0.0f,
                                    grey.withAlpha (0.08f), 0.0f, h, false);
     g.setGradientFill (greyGrad);
 
-    juce::Path inFill (inCurve);
-    inFill.lineTo (plotW, h);
-    inFill.lineTo (0.0f, h);
-    inFill.closeSubPath();
-    g.fillPath (inFill);
+    inFill_.clear();
+    appendDecimated (inFill_, histIn_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
+    inFill_.lineTo (plotW, h);
+    inFill_.lineTo (0.0f, h);
+    inFill_.closeSubPath();
+    g.fillPath (inFill_);
 
     g.setColour (grey.withAlpha (0.55f));
-    g.strokePath (inCurve, juce::PathStrokeType (1.0f));
+    g.strokePath (inCurve_, juce::PathStrokeType (1.0f));
 
     // Layer 2: the OUTPUT level, styled like the Crunch EQ's accent spectrum
     // layer (theme accent gradient fill + the 2 px white outline). Signal source
     // unchanged: the output peak history. It sits on top of the input layer, so
     // make-up gain shows as accent sticking out of the grey, and compression
     // shows as grey sticking out of the accent.
-    juce::Path outCurve;
-    appendDecimated (outCurve, histOut_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
+    outCurve_.clear();
+    appendDecimated (outCurve_, histOut_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
 
     const auto accent = accentColour();
     juce::ColourGradient accentGrad (accent.withAlpha (0.65f), 0.0f, 0.0f,
                                      accent.withAlpha (0.10f), 0.0f, h, false);
     g.setGradientFill (accentGrad);
 
-    juce::Path outFill (outCurve);
-    outFill.lineTo (plotW, h);
-    outFill.lineTo (0.0f, h);
-    outFill.closeSubPath();
-    g.fillPath (outFill);
+    outFill_.clear();
+    appendDecimated (outFill_, histOut_.data(), n, endOffset, false, [this] (float db) { return dbToY (db); });
+    outFill_.lineTo (plotW, h);
+    outFill_.lineTo (0.0f, h);
+    outFill_.closeSubPath();
+    g.fillPath (outFill_);
 
     // white outline of the output layer
     g.setColour (juce::Colours::white.withAlpha (0.95f));
-    g.strokePath (outCurve, juce::PathStrokeType (2.0f));
+    g.strokePath (outCurve_, juce::PathStrokeType (2.0f));
 }
 
 // Red gain-reduction curve: shows the amount of compression over time on the
@@ -287,32 +386,25 @@ void DisplayView::drawGrCurve (juce::Graphics& g)
         return;
 
     // per-column minimum = deepest compression in that column
-    juce::Path p;
-    appendDecimated (p, histGr_.data(), n, historyEndOffset(), true, [this] (float db) { return grToY (db); });
+    grPath_.clear();
+    appendDecimated (grPath_, histGr_.data(), n, historyEndOffset(), true, [this] (float db) { return grToY (db); });
 
     g.setColour (CrunchPalette::grLine (processor_.isLightTheme()));
-    g.strokePath (p, juce::PathStrokeType (1.6f));
+    g.strokePath (grPath_, juce::PathStrokeType (1.6f));
 }
 
 void DisplayView::drawTransferCurve (juce::Graphics& g)
 {
     const bool light = processor_.isLightTheme();
     const int points = 128;
-    processor_.getTransferCurve (kGraphBottomDb, kGraphTopDb, points, curveInDb_, curveOutDb_);
     const auto& inDb  = curveInDb_;
     const auto& outDb = curveOutDb_;
 
-    // bottom layer: white static transfer curve (full, never moves)
-    juce::Path base;
-    for (int i = 0; i < points; ++i)
-    {
-        const float x = dbToX (inDb[(size_t) i]);
-        const float y = dbToY (outDb[(size_t) i]);
-        if (i == 0) base.startNewSubPath (x, y);
-        else base.lineTo (x, y);
-    }
+    // bottom layer: white static transfer curve (full, never moves).
+    // Geometry is cached by timerCallback() (see transferBasePath_); it is
+    // only rebuilt when the parameters or the size change.
     g.setColour (CrunchPalette::curveBase (light).withAlpha (0.55f));
-    g.strokePath (base, juce::PathStrokeType (2.0f));
+    g.strokePath (transferBasePath_, juce::PathStrokeType (2.0f));
 
     // top layer: green segment of the same curve, from the origin up to the
     // current output level. Its endpoint slides along the white curve as the
@@ -348,7 +440,8 @@ void DisplayView::drawTransferCurve (juce::Graphics& g)
         fracIdx = (float) i;
     }
 
-    juce::Path live;
+    juce::Path& live = livePath_;
+    live.clear();
     for (int i = 0; i <= (int) fracIdx; ++i)
     {
         const float x = dbToX (inDb[(size_t) i]);
@@ -375,9 +468,15 @@ void DisplayView::drawGainReduction (juce::Graphics& g)
 {
     const float grDb = juce::jmax (0.0f, -processor_.getGainReductionDb());
 
-    g.setFont (CrunchLookAndFeel::uiFont (12.0f, 500));
+    g.setFont (CrunchLookAndFeel::uiFont (kGrReadoutFontPx, kGrReadoutFontWeight));
     g.setColour (CrunchPalette::textDim (processor_.isLightTheme()));
-    g.drawText ("GR " + juce::String (grDb, 1) + " dB", plotWidth() - 132, 3, 124, 17, juce::Justification::right, false);
+
+    // Right-aligned in the reserved top strip, clear of the meter column on
+    // the right. The box is wide enough for the longest readout and vertically
+    // centred, so the larger type stays inside topInset() (above the 0 dB
+    // grid line) at every editor size.
+    g.drawText ("GR " + juce::String (grDb, 1) + " dB",
+                plotWidth() - 180, 3, 172, 25, juce::Justification::right, false);
 }
 
 void DisplayView::drawMeters (juce::Graphics& g)
@@ -457,12 +556,21 @@ void DisplayView::drawMeters (juce::Graphics& g)
 
 void DisplayView::paint (juce::Graphics& g)
 {
-    drawGrid (g);
-    drawHistoryGraph (g);
-    drawGrCurve (g);
+    refreshGridCache();
+    g.drawImageAt (gridImage_, 0, 0);
 
-    if (kneeButton_.getToggleState())
-        drawTransferCurve (g);
+    // While the window is being dragged, every OS move event already forces a
+    // full repaint; the scrolling history fills are the expensive part of the
+    // frame, so they are dropped for those repaints only (the grid, GR readout
+    // and meters stay correct). Normal ticks redraw everything.
+    if (! processor_.isWindowDragging())
+    {
+        drawHistoryGraph (g);
+        drawGrCurve (g);
+
+        if (kneeButton_.getToggleState())
+            drawTransferCurve (g);
+    }
 
     drawGainReduction (g);
     drawMeters (g);
