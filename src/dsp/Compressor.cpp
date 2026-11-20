@@ -65,23 +65,29 @@ void Compressor::setParameters (float thresholdDb, float ratio, float attackMs, 
     }
 }
 
-float Compressor::computeGainDb (float levelDb) const noexcept
+float Compressor::gainForLevel (float levelDb, float thresholdDb, float ratio, float kneeDb) noexcept
 {
-    const float slope    = 1.0f / ratio_ - 1.0f;   // negative for ratio > 1
-    const float halfKnee = kneeDb_ * 0.5f;
+    const float slope    = 1.0f / juce::jmax (1.0f, ratio) - 1.0f;   // negative for ratio > 1
+    const float width    = juce::jmax (0.0f, kneeDb);
+    const float halfKnee = width * 0.5f;
 
-    if (kneeDb_ <= 0.0f)
-        return levelDb > thresholdDb_ ? slope * (levelDb - thresholdDb_) : 0.0f;
+    if (width <= 0.0f)
+        return levelDb > thresholdDb ? slope * (levelDb - thresholdDb) : 0.0f;
 
-    if (levelDb <= thresholdDb_ - halfKnee)
+    if (levelDb <= thresholdDb - halfKnee)
         return 0.0f;
 
-    if (levelDb >= thresholdDb_ + halfKnee)
-        return slope * (levelDb - thresholdDb_);
+    if (levelDb >= thresholdDb + halfKnee)
+        return slope * (levelDb - thresholdDb);
 
     // quadratic interpolation inside the knee
-    const float over = levelDb - thresholdDb_ + halfKnee;   // 0 .. kneeDb_
-    return slope * over * over / (2.0f * kneeDb_);
+    const float over = levelDb - thresholdDb + halfKnee;   // 0 .. width
+    return slope * over * over / (2.0f * width);
+}
+
+float Compressor::computeGainDb (float levelDb) const noexcept
+{
+    return gainForLevel (levelDb, thresholdDb_, ratio_, kneeDb_);
 }
 
 void Compressor::processSample (float& left, float& right) noexcept

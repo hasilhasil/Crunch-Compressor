@@ -2,38 +2,103 @@
 
 #include <JuceHeader.h>
 
+#include <cmath>
 #include <complex>
-
-#include "../Parameters.h"
 
 struct BiquadCoefficients
 {
     double b0 = 1.0, b1 = 0.0, b2 = 0.0;
     double a1 = 0.0, a2 = 0.0;   // a0 is normalised to 1.0
+
+    inline void clampToStableTriangle() noexcept
+    {
+        if (! (std::isfinite (b0) && std::isfinite (b1) && std::isfinite (b2)
+               && std::isfinite (a1) && std::isfinite (a2)))
+        {
+            b0 = 1.0; b1 = 0.0; b2 = 0.0; a1 = 0.0; a2 = 0.0;
+            return;
+        }
+        a2 = juce::jlimit (-0.999999, 0.999999, a2);
+        const double maxAbsA1 = juce::jmax (0.0, (1.0 + a2) - 1.0e-7);
+        a1 = juce::jlimit (-maxAbsA1, maxAbsA1, a1);
+    }
 };
 
 class BiquadFilter
 {
 public:
-    void setCoefficients (const BiquadCoefficients& c)
+    void setCoefficients (const BiquadCoefficients& c) noexcept
     {
         b0_ = c.b0; b1_ = c.b1; b2_ = c.b2;
         a1_ = c.a1; a2_ = c.a2;
+
+        // Cytomic ZDF TPT SVF state-space mapping (ported from Crunch EQ):
+        // algebraically equivalent steady-state transfer function with superior
+        // numerical stability and modulation behavior in 64-bit precision.
+        const double dPlus  = 1.0 + a1_ + a2_;
+        const double dMinus = 1.0 - a1_ + a2_;
+        if (dPlus > 1.0e-15 && dMinus > 1.0e-15)
+        {
+            const double g     = std::sqrt (dPlus / dMinus);
+            const double gk    = (2.0 * (1.0 - a2_)) / dMinus;
+            const double denom = 1.0 + g * g + gk;
+            svfA1_ = 1.0 / denom;
+            svfA2_ = g * svfA1_;
+            svfA3_ = g * svfA2_;
+
+            m0_ = (b0_ - b1_ + b2_) / dMinus;
+            m2_ = (b0_ + b1_ + b2_) / dPlus - m0_;
+            m1_ = (2.0 * ((b0_ - b2_) - m0_ * (1.0 - a2_))) / (g * dMinus);
+            useSvf_ = true;
+        }
+        else
+        {
+            useSvf_ = false;
+        }
     }
 
-    void reset()
+    void reset() noexcept
     {
-        z1_ = 0.0;
-        z2_ = 0.0;
+        s1_ = 0.0;
+        s2_ = 0.0;
+    }
+
+    BiquadCoefficients getCoefficients() const noexcept
+    {
+        return { b0_, b1_, b2_, a1_, a2_ };
+    }
+
+    std::complex<double> responseAtDouble (double freqHz, double sampleRate) const noexcept
+    {
+        const double w  = juce::MathConstants<double>::twoPi * freqHz / sampleRate;
+        const double cw = std::cos (w), sw = std::sin (w);
+        const double c2 = cw * cw - sw * sw, s2 = 2.0 * sw * cw;
+        const std::complex<double> num (b0_ + b1_ * cw + b2_ * c2, -(b1_ * sw + b2_ * s2));
+        const std::complex<double> den (1.0 + a1_ * cw + a2_ * c2, -(a1_ * sw + a2_ * s2));
+        return (std::norm (den) > 1.0e-30) ? (num / den) : std::complex<double> (1.0, 0.0);
+    }
+
+    double processSampleDouble (double in) noexcept
+    {
+        if (useSvf_)
+        {
+            const double v3 = in - s2_;
+            const double v1 = svfA1_ * s1_ + svfA2_ * v3;
+            const double v2 = s2_ + svfA2_ * s1_ + svfA3_ * v3;
+            s1_ = 2.0 * v1 - s1_;
+            s2_ = 2.0 * v2 - s2_;
+            return m0_ * in + m1_ * v1 + m2_ * v2;
+        }
+
+        const double y = b0_ * in + s1_;
+        s1_ = b1_ * in - a1_ * y + s2_;
+        s2_ = b2_ * in - a2_ * y;
+        return y;
     }
 
     float processSample (float x) noexcept
     {
-        const double in  = (double) x;
-        const double y   = b0_ * in + z1_;
-        z1_ = b1_ * in - a1_ * y + z2_;
-        z2_ = b2_ * in - a2_ * y;
-        return (float) y;
+        return (float) processSampleDouble ((double) x);
     }
 
     void processBlock (float* data, int numSamples) noexcept
@@ -42,18 +107,15 @@ public:
             data[i] = processSample (data[i]);
     }
 
+    void processBlockDouble (double* data, int numSamples) noexcept
+    {
+        for (int i = 0; i < numSamples; ++i)
+            data[i] = processSampleDouble (data[i]);
+    }
+
     std::complex<float> responseAt (float freqHz, float sampleRate) const
     {
-        const double w = juce::MathConstants<double>::twoPi * freqHz / sampleRate;
-        const std::complex<double> z1 (std::cos (w), -std::sin (w));
-        const std::complex<double> z2 (std::cos (2.0 * w), -std::sin (2.0 * w));
-
-        const std::complex<double> num (b0_ + b1_ * z1.real() + b2_ * z2.real(),
-                                        b1_ * z1.imag() + b2_ * z2.imag());
-        const std::complex<double> den (1.0 + a1_ * z1.real() + a2_ * z2.real(),
-                                        a1_ * z1.imag() + a2_ * z2.imag());
-
-        const auto h = num / den;
+        const auto h = responseAtDouble ((double) freqHz, (double) sampleRate);
         return std::complex<float> ((float) h.real(), (float) h.imag());
     }
 
@@ -119,6 +181,7 @@ public:
         return c;
     }
 
+    // LowCut = 高通 (high-pass), HighCut = 低通 (low-pass)
     static BiquadCoefficients designLowCut (float freq, float q, float sr)
     {
         const double w0 = juce::MathConstants<double>::twoPi * freq / sr;
@@ -220,5 +283,8 @@ public:
 private:
     double b0_ = 1.0, b1_ = 0.0, b2_ = 0.0;
     double a1_ = 0.0, a2_ = 0.0;
-    double z1_ = 0.0, z2_ = 0.0;
+    double svfA1_ = 0.0, svfA2_ = 0.0, svfA3_ = 0.0;
+    double m0_ = 1.0, m1_ = 0.0, m2_ = 0.0;
+    double s1_ = 0.0, s2_ = 0.0;
+    bool   useSvf_ = false;
 };

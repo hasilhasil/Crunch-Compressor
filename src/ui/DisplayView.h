@@ -2,22 +2,23 @@
 
 #include <JuceHeader.h>
 
+#include <atomic>
 #include <functional>
 #include <vector>
 
 #include "../PluginProcessor.h"
-#include "LookAndFeel.h"
+#include "CompTheme.h"
+#include "EditorLayout.h"
+#include "Anim.h"
+#include "PackPopupOverlay.h"
 
-// Settings (gear) button: a plain juce::TextButton whose text is the gear
-// character U+2699, drawn by CrunchLookAndFeel::drawButtonBackground so it gets
-// exactly the same rounded-pill treatment as the Crunch EQ plugin's button.
-
-// Upper display, Pro-C style:
-//  - top strip: red gain-reduction curve (compression amount over time)
-//  - main graph: scrolling level history (grey input area, light output line)
-//  - two-layer knee transfer curve: white static layer + green layer that
-//    bounces with the live gain reduction
-//  - input/output peak meters on the right + GR readout
+// ============================================================
+// DisplayView — Crunch Compressor 上半区主画布（Pro-C 2 级示波器时间轴 + Hasil 四包正交顶栏/电平表）
+//   · 100% 保留原版 Ring-Anchored 5s 滚动输入/输出包络 + 同标尺压缩红线 + 双层拐点传递曲线
+//   · 叠加 Crunch EQ 同款 IGN 蓝噪声抖动谐波染色渐变底板（Warm / Cold / Clip）
+//   · 悬停或拖拽底部 THRESHOLD 旋钮时，平滑浮现水平阈值参考虚线与 dB 标签
+//   · Classic 直角全出血 / Neumorphism 16px 圆角内凹屏幕槽（单图缓存 wellRimCache_，零 ID2D1Layer 开销）
+// ============================================================
 class DisplayView : public juce::Component,
                     public juce::Timer
 {
@@ -26,108 +27,124 @@ public:
     ~DisplayView() override;
 
     void paint (juce::Graphics&) override;
+    void paintOverChildren (juce::Graphics&) override;
     void resized() override;
     void timerCallback() override;
 
-    std::function<void()> onThemeChanged;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    bool keyPressed (const juce::KeyPress&) override;
 
-    // Called by the editor whenever any parameter change was notified: the
-    // static transfer curve is only recomputed when something actually
-    // changed, so a static instance costs nothing per frame.
-    void parametersChanged() { transferDirty_ = true; }
+    // 四包正交组合控制 API
+    const UiPack::UiSnapshot& getUiSnapshot() const noexcept { return composition_.snapshot(); }
+    void reloadUiPacksFromProcessor();
+    UiPack::VerificationVerdict setUiPacks (UiPack::ThemeId t, UiPack::PaletteId p,
+                                            UiPack::LayoutId l, UiPack::LocaleId lc);
+    UiPack::VerificationVerdict setThemePack   (UiPack::ThemeId t);
+    UiPack::VerificationVerdict setPalettePack (UiPack::PaletteId p);
+    UiPack::VerificationVerdict setLayoutPack  (UiPack::LayoutId l);
+    UiPack::VerificationVerdict setLocalePack  (UiPack::LocaleId lc);
+    UiPack::VerificationVerdict applyNeumorphismPreset (UiPack::PaletteId pal = UiPack::PaletteId::NeuLight);
+    UiPack::VerificationVerdict applyClassicPreset     (UiPack::PaletteId pal = UiPack::PaletteId::Blue);
+    void rollbackUiPacks();
+
+    void parametersChanged();
+    void ensureTimerFullRate();
+    void setThresholdGuideActive (bool active);
+    void syncHistoryImmediateForSnapshot();
+
+    // 外部回调（由 PluginEditor 注入）
+    std::function<void()>         onCompositionChanged;
+    std::function<void (double)>  onTickKnobs;
+    std::function<bool()>         isExternalAnimating;
+    std::function<void()>         onPresetApplied;
 
 private:
-    void drawGrid (juce::Graphics& g);
-    void refreshGridCache();
-    void drawHistoryGraph (juce::Graphics& g);
-    void drawGrCurve (juce::Graphics& g);
-    void drawTransferCurve (juce::Graphics& g);
-    void drawGainReduction (juce::Graphics& g);
-    void drawMeters (juce::Graphics& g);
-    void showSettingsMenu();
+    EditorLayout makeLayout() const;
+    juce::Rectangle<float> plotWellRect() const;
+    void applyCompositionSnapshot (bool persistToProcessor);
 
-    float grToY (float grDb) const;
-    float dbToY (float db) const;
-    float dbToX (float db) const;
-    int   plotWidth() const;
+    void rebuildTransferCurveIfNeeded (const juce::Rectangle<float>& well);
 
-    // Theme accent (same source of truth as the EQ plugin).
-    juce::Colour accentColour() const;
+    void drawBackground     (juce::Graphics& g, const EditorLayout& lay);
+    void drawColourWash     (juce::Graphics& g, const EditorLayout& lay);
+    void drawGrid           (juce::Graphics& g, const EditorLayout& lay);
+    void drawHistoryGraph   (juce::Graphics& g, const EditorLayout& lay);
+    void drawGrCurve        (juce::Graphics& g, const EditorLayout& lay);
+    void drawTransferCurve  (juce::Graphics& g, const EditorLayout& lay);
+    void drawThresholdGuide (juce::Graphics& g, const EditorLayout& lay, float guideAlpha);
+    void drawScales         (juce::Graphics& g, const EditorLayout& lay);
+    void drawMeters         (juce::Graphics& g, const EditorLayout& lay);
+    void drawTopStrip       (juce::Graphics& g, const EditorLayout& lay);
+    void drawPackSwitcher   (juce::Graphics& g, const EditorLayout& lay);
+    void drawPresetMenu     (juce::Graphics& g, const EditorLayout& lay);
 
-    // Top inset reserved for the GR readout / settings button; the level
-    // graph starts below it. The GR curve shares the same dB scale as the
-    // graph (0 dB at the top inset, -60 dB at the bottom), so its amount can
-    // be read directly against the left axis instead of a separate strip
-    // scale that used to clip at -24 dB.
-    float topInset() const;
+    void drawHairlineH (juce::Graphics& g, float y, float x0, float x1, juce::Colour c) const;
+    void drawHairlineV (juce::Graphics& g, float x, float y0, float y1, juce::Colour c) const;
 
-    // Cursor position of the newest drawn history point, in array units
-    // (see scrollCursor_ / historyBase_). 0 when no history is available.
+    int  hitTestChromeHoverId (juce::Point<float> pos, const EditorLayout& lay) const;
+    void togglePackSwitcher();
+    void closePackSwitcher();
+    bool handlePackSwitcherClick (juce::Point<float> p, const EditorLayout& lay);
+
+    juce::Rectangle<float> presetPrimaryRect     (const EditorLayout& lay) const;
+    juce::Rectangle<float> presetSecondaryRect   (const EditorLayout& lay) const;
+    juce::Rectangle<float> presetCategoryRowRect (const EditorLayout& lay, int cat) const;
+    juce::Rectangle<float> presetItemRowRect     (const EditorLayout& lay, int itemInCat) const;
+    juce::Rectangle<float> presetSaveAsRect      (const EditorLayout& lay) const;
+    void openPresetMenu();
+    void closePresetMenu();
+    bool handlePresetMenuClick (juce::Point<float> p, const EditorLayout& lay);
+
+    float grToY (float grDb, const juce::Rectangle<float>& well, float scale) const;
+    float dbToY (float db, const juce::Rectangle<float>& well, float scale) const;
+    float dbToX (float db, const juce::Rectangle<float>& well) const;
+    float meterY (float db, const EditorLayout& lay) const;
     float historyEndOffset() const;
 
-    // Decimated polyline helper using a FIXED time-based x mapping: one
-    // history point always spans pxPerPoint pixels and the newest drawn
-    // point sits at the right edge, so the graph scrolls by pure translation
-    // at a constant px/ms — no zoom-out while the history fills up, and no
-    // residual per-frame scaling at steady state. Each pixel column takes the
-    // extreme value inside it (no path bloat).
-    //
-    // The columns are anchored to a FIXED grid in ring-position (absolute
-    // time) space, NOT to the sliding right edge. The previous version
-    // derived every column's data window from the fractional scroll offset,
-    // so with ~11 samples per column and a ~3 px/frame advance at 60 Hz the
-    // exact set of samples in each column changed every frame: the selected
-    // peak hopped to a neighbouring sample, moving the vertex up/down by
-    // several dB and sideways by up to a pixel every frame. On the thin
-    // output stroke that read as an abnormal shimmer/jitter (the grey input
-    // fill hid the same artifact).
-    //
-    // With a ring-anchored grid a column's value only depends on the ring
-    // samples it covers, so the decimated shape is frozen and the scroll is a
-    // pure sub-pixel translation: every vertex moves by exactly the same
-    // amount while new columns merely enter/leave at the edges. No vertex is
-    // ever re-selected mid-scroll, so nothing boils.
-    // NOTE: uses an explicit "started" flag, NOT Path::isEmpty() — a path
-    // containing only move markers still reports isEmpty() == true.
+    // Ring-anchored sub-pixel decimated polyline builder (zero boiling/shimmer while scrolling).
+    // Returns true if >= 2 points were emitted, writing outFirstX / outLastX for single-pass fill closure.
     template <typename MapY>
-    void appendDecimated (juce::Path& path, const float* values, int n, float endOffset, bool useMin, MapY mapY) const
+    bool appendDecimated (juce::Path& path, const float* values, int n, float endOffset,
+                          const juce::Rectangle<float>& well, bool useMin,
+                          float& outFirstX, float& outLastX, MapY mapY) const
     {
-        const float plotW = (float) plotWidth();
+        const float plotX0 = well.getX();
+        const float plotW  = well.getWidth();
+        outFirstX = plotX0;
+        outLastX  = plotX0 + plotW;
         if (n < 2 || endOffset < 1.0f || plotW <= 1.0f)
-            return;
+            return false;
 
         const float pxPerPoint = plotW / (float) (kHistoryPoints - 1);
         if (pxPerPoint <= 0.0f)
-            return;
+            return false;
 
-        const double pointsPerPx = 1.0 / (double) pxPerPoint;   // ring points per pixel column
-        const double rightIdx = (double) endOffset;             // array index at the right edge
-        const double baseRing = historyBase_;                   // ring position of array index 0
-        const double scrollRing = baseRing + rightIdx;          // ring position at the right edge
+        const double pointsPerPx = 1.0 / (double) pxPerPoint;
+        const double rightIdx    = (double) endOffset;
+        const double baseRing    = historyBase_;
+        const double scrollRing  = baseRing + rightIdx;
 
-        // Visible columns: k covers ring positions [k*P, (k+1)*P); it is on
-        // screen while its centre x lies in [0, plotW]. One column of margin
-        // is kept on each side so partial columns are drawn, not popped in.
         const double kMinD = std::ceil ((scrollRing - (double) (kHistoryPoints - 1)) / pointsPerPx - 0.5) - 1.0;
         const double kMaxD = std::floor (scrollRing / pointsPerPx - 0.5) + 1.0;
 
-        const long long kMin = (long long) kMinD;
-        const long long kMax = (long long) kMaxD;
-        const long long nMinus1 = (long long) n - 1;
+        const long long kMin      = (long long) kMinD;
+        const long long kMax      = (long long) kMaxD;
+        const long long nMinus1   = (long long) n - 1;
         const long long baseRingI = (long long) std::llround (baseRing);
 
-        bool started = false;
+        int emitted = 0;
 
         for (long long k = kMin; k <= kMax; ++k)
         {
             const double centreRing = ((double) k + 0.5) * pointsPerPx;
 
-            // frozen data range of this column, in array-index units
             const long long a0Raw = (long long) std::ceil ((double) k * pointsPerPx) - baseRingI;
             const long long a1Raw = (long long) std::ceil (((double) k + 1.0) * pointsPerPx) - 1 - baseRingI;
 
             if (a1Raw < 0 || a0Raw > nMinus1)
-                continue;                       // column is outside the available history
+                continue;
 
             const long long a0 = juce::jmax (0LL, a0Raw);
             const long long a1 = juce::jmin (nMinus1, a1Raw);
@@ -139,128 +156,114 @@ private:
                 v = useMin ? juce::jmin (v, values[(size_t) i])
                            : juce::jmax (v, values[(size_t) i]);
 
-            const float x = plotW - (float) ((scrollRing - centreRing) * (double) pxPerPoint);
+            const float x = plotX0 + plotW - (float) ((scrollRing - centreRing) * (double) pxPerPoint);
             const float y = mapY (v);
 
-            if (! started)
+            if (emitted == 0)
             {
                 path.startNewSubPath (x, y);
-                started = true;
+                outFirstX = x;
             }
             else
             {
                 path.lineTo (x, y);
             }
+            outLastX = x;
+            ++emitted;
         }
+        return emitted >= 2;
     }
 
     CrunchCompressorAudioProcessor& processor_;
+    UiPack::UiComposition composition_;
 
-    // Level history scratch buffers, filled from the processor each tick.
-    // kHistoryPoints is the DISPLAYED time span (~5 s at 0.5 ms per point): it
-    // sets the px/point scale. The buffers deliberately hold — and readHistory
-    // is asked for — extra OLDER points beyond that span. The left edge of the
-    // visible window is then always well inside the available history, so the
-    // first drawn column is never clipped by the ring's oldest sample. Without
-    // that margin the endpoint column's data range gets truncated as samples
-    // age out, so its value and cell identity change every few ms and the left
-    // tip of the curves visibly jitters.
-    static constexpr int kHistoryPoints     = 10000;   // ~5 s display span
-    static constexpr int kHistoryReadPoints = 11000;   // span + ~0.5 s older margin
-    std::vector<float> histIn_, histOut_, histGr_;
-    int historyPoints_ = 0;
-
-    // Scroll cursor: the drawn window ends at scrollCursor_ (ring-point
-    // units), exponentially smoothed toward the newest recorded point.
-    // Host message loops deliver timer ticks irregularly, which would make
-    // the scroll step jitter (2-4 px per frame); the smoothing absorbs that
-    // so the waveform glides at a steady rate (~60 ms lag, invisible on a
-    // multi-second history). The smoothing is time-based so the glide rate
-    // does not change with the host's message-loop tick rate.
-    // historyBase_ is the ring position of array index 0 of the last read.
-    // Both are double: the scroll is a sub-pixel translation and float
-    // rounding at ~10^7 ring points would show up as a visible wobble.
+    // 5s 滚动历史缓冲（含 0.5s 左缘防截断余量）
+    static constexpr int    kHistoryPoints         = 10000;
+    static constexpr int    kHistoryReadPoints     = 11000;
     static constexpr double kScrollTimeConstantSec = 0.06;
-    double scrollCursor_ = -1.0;
-    double historyBase_ = 0.0;
-    double lastTickMs_ = 0.0;
+    static constexpr float  kHistoryStrideMs       = 0.5f;
+    static constexpr float  kGrHoldMs              = 50.0f;
 
-    // transfer-curve scratch (members, so no per-frame heap allocation)
+    std::vector<float> histIn_, histOut_, histGr_;
+    int    historyPoints_ = 0;
+    double scrollCursor_  = -1.0;
+    double historyBase_   = 0.0;
+    double lastTickMs_    = 0.0;
+
+    // 静态与动态传递曲线缓存
     std::vector<float> curveInDb_, curveOutDb_;
-
-    // Per-frame paths as members: juce::Path::clear() keeps the allocated
-    // capacity, so the scrolling history curves rebuild every frame without
-    // touching the allocator once warmed up.
     juce::Path inCurve_, inFill_, outCurve_, outFill_, grPath_, livePath_;
-
-    // Static transfer-curve geometry, rebuilt only when the parameters (or the
-    // component size) change - never per repaint.
     juce::Path transferBasePath_;
     bool  transferDirty_ = true;
-    int   transferBaseW_ = -1, transferBaseH_ = -1;
+    juce::Rectangle<float> transferWellBuilt_;
 
-    // Static grid cache (background, lines, axis labels): the grid and its 11
-    // dB labels only change when the component is resized or the theme
-    // changes, so they are rendered once into an image and blitted instead of
-    // re-shaping text on every animation frame. Opaque ARGB so the blit is a
-    // direct copy under the software renderer (the editor pins the peer to
-    // it, see PluginEditor::forceSoftwareRenderer).
-    juce::Image gridImage_;
-    int   gridCacheW_ = -1, gridCacheH_ = -1;
-    bool  gridCacheLight_ = false;
+    // 稳态背景+网格位图缓存 + IGN 染色渐变缓存 + 新拟物圆角内凹视窗边框缓存
+    juce::Image  staticPlotBgCache_;
+    int          staticPlotBgW_        = 0;
+    int          staticPlotBgH_        = 0;
+    juce::uint32 staticPlotBgRev_      = 0;
+    int          staticPlotStableHits_ = 0;
 
-    // Last painted state, so a tick repaints only when the picture can
-    // actually differ (the graph scrolls / the meters move / the cursor is
-    // still gliding / the GR text changed). A stopped, silent instance
-    // converges to zero repaints instead of redrawing 60x/s.
-    unsigned lastPaintedCounter_ = 0;
-    double   lastPaintedCursor_  = -1.0;
-    float    lastPaintedGr_      = -1000.0f;
-    bool     lastPaintedKnee_    = false;
-    float    lastMeterIn_  = -200.0f, lastMeterOut_  = -200.0f;
-    float    lastPeakIn_   = -200.0f, lastPeakOut_   = -200.0f;
+    juce::Image  colourWashCache_;
+    float        colourWashAmount_ = -1000.0f;
+    int          colourWashMode_   = -1;
+    juce::uint32 colourWashRev_    = 0;
+    int          colourWashW_      = 0;
+    int          colourWashH_      = 0;
 
-    // meter ballistics (peak-hold with 1 dB/tick decay)
-    float meterInDb_ = -120.0f;
-    float meterOutDb_ = -120.0f;
-    float meterInDbLabel_ = -120.0f;
-    float meterOutDbLabel_ = -120.0f;
+    juce::Image  wellRimCache_;
+    juce::uint32 wellRimRev_ = 0;
+    int          wellRimW_   = 0;
+    int          wellRimH_   = 0;
 
-    // Peak-hold for the meter top strokes, ported from the Crunch EQ plugin:
-    // the stroke rides the peak and holds it for kPeakHoldMs before falling
-    // back, so a short peak stays readable (Pro-Q 3 style). The bar itself
-    // keeps its fast (instant up / 60 dB per second down) ballistics.
-    static constexpr int kPeakHoldMs = 2000;          // 1-3 s, as requested
-    static constexpr float kPeakFallDbPerSec = 30.0f; // after the hold expires
+    // 品牌宽度缓存
+    float brandCrunchWidth_ = 0.0f;
+    float brandCrunchScale_ = 0.0f;
 
-    float peakInDb_  = -120.0f, peakOutDb_  = -120.0f;
-    juce::uint32 peakInHoldUntilMs_ = 0, peakOutHoldUntilMs_ = 0;
-    juce::uint32 lastMeterMs_ = 0;
+    // 顶栏 A/B 滑块动画、阈值引导线淡入淡出与弹出层状态
+    Tween abSlideTween_;
+    Tween threshGuideTween_;
+    bool  threshGuideTarget_   = false;
+    bool  lastAbSlotB_         = false;
+    bool  packMenuOpen_        = false;
+    bool  presetMenuOpen_      = false;
+    int   presetHoverCategory_ = 0;
+    int   presetHoverItem_     = -1;
+    bool  presetHoverSaveAs_   = false;
+    int   lastHoveredChromeId_ = -1;
+    juce::Point<float> lastMousePos_ { -100.0f, -100.0f };
+
+    // 右侧 IN/OUT 电平表弹道（2000ms 峰值保持 + >0dB 纯红告警 + 250ms 读数节流）
+    static constexpr int   kPeakHoldMs       = 2000;
+    static constexpr float kPeakFallDbPerSec = 30.0f;
+    float meterInDb_  = -60.0f, meterOutDb_  = -60.0f;
+    float peakInDb_   = -60.0f, peakOutDb_   = -60.0f;
+    float labelInDb_  = -60.0f, labelOutDb_  = -60.0f;
+    juce::uint32 peakInHoldUntilMs_  = 0;
+    juce::uint32 peakOutHoldUntilMs_ = 0;
+    juce::uint32 nextMeterLabelMs_   = 0;
+    juce::uint32 lastMeterMs_        = 0;
 
     void updatePeakHold (float& peakDb, juce::uint32& holdUntilMs,
                          float levelDb, juce::uint32 nowMs, double dt);
 
-    juce::TextButton settingsButton_;
-    juce::TextButton kneeButton_;
-    juce::Label kneeLabel_;
+    // 帧间重绘收敛与 60Hz <-> 15Hz 动态空闲降频
+    unsigned lastPaintedCounter_ = 0;
+    double   lastPaintedCursor_  = -1.0;
+    float    lastPaintedGr_      = -1000.0f;
+    bool     lastPaintedKnee_    = true;
 
-    // GR readout (top right, the concrete amount of compression, e.g.
-    // "GR 6.3 dB"). It is the number the eye lands on first, so it sits a
-    // few notches above the other small display text (axis labels 10.5 px,
-    // meter labels/readouts 11/10 px) and in SemiBold, which keeps the value
-    // legible at a glance. The reserved strip stays inside topInset(), so the
-    // larger type never collides with the 0 dB grid line underneath it.
-    static constexpr float kGrReadoutFontPx     = 19.0f;
-    static constexpr int   kGrReadoutFontWeight = 600;
+    static constexpr int kIdleHz         = 15;
+    static constexpr int kIdleHoldFrames = 30;
+    int  idleFrames_     = 0;
+    bool uiStatePending_ = true;
+    std::atomic<bool> paramChangedFlag_ { true };
 
-    static constexpr int   kMeterWidth = 60;
-    static constexpr float kGraphTopDb = 0.0f;    // left axis: 0 dB at the top
+    static constexpr float kGraphTopDb    = 0.0f;
     static constexpr float kGraphBottomDb = -60.0f;
-    static constexpr float kAxisStepDb = 6.0f;    // grid + label every 6 dB
-    static constexpr float kMeterTopDb = 6.0f;    // meters keep headroom above 0 dB
+    static constexpr float kAxisStepDb    = 6.0f;
+    static constexpr float kMeterTopDb    = 6.0f;
     static constexpr float kMeterBottomDb = -60.0f;
-    static constexpr float kHistoryStrideMs = 0.5f;   // one history point per 0.5 ms
-    static constexpr float kGrHoldMs = 50.0f;         // green curve peak-hold time
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DisplayView)
 };

@@ -31,10 +31,14 @@ public:
     // Static transfer function: gain (dB) applied to a signal at levelDb,
     // including the current auto-gain makeup. Used by the UI to draw the knee
     // curve. The makeup is atomically mirrored for the UI thread.
+    static float gainForLevel (float levelDb, float thresholdDb, float ratio, float kneeDb) noexcept;
+
     float getAppliedGainDb (float levelDb) const noexcept
     {
         return computeGainDb (levelDb) + makeupDb_.load (std::memory_order_relaxed);
     }
+
+    float getMakeupDb() const noexcept { return makeupDb_.load (std::memory_order_relaxed); }
 
     // Detector level (dB) of the last processed sample; used by the host to
     // record the input level history for the display.

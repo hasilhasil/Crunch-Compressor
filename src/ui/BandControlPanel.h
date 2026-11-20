@@ -2,127 +2,27 @@
 
 #include <JuceHeader.h>
 
+#include <array>
+#include <atomic>
+#include <functional>
+
 #include "../PluginProcessor.h"
-#include "LookAndFeel.h"
+#include "CompTheme.h"
+#include "EditorLayout.h"
+#include "Anim.h"
+#include "Knob.h"
+#include "PackPopupOverlay.h"
 
-// Plain text pill for Auto Gain: rounded track, accent fill when engaged,
-// with a soft glow behind the label.
-class AutoGainButton : public juce::Button
-{
-public:
-    AutoGainButton() : juce::Button ("Auto Gain") {}
-
-    void paintButton (juce::Graphics& g, bool shouldDrawButtonAsHighlighted,
-                      bool shouldDrawButtonAsDown) override
-    {
-        const bool on = getToggleState();
-        const auto accent = accentColour();
-
-        auto bounds = getLocalBounds().toFloat().reduced (0.5f);
-        const float corner = juce::jmin (14.0f, bounds.getHeight() * 0.5f);
-        g.setColour (on ? accent : CrunchPalette::track (isLightTheme()).withAlpha (0.9f));
-        g.fillRoundedRectangle (bounds, corner);
-
-        if (on)
-        {
-            rebuildGlowIfNeeded (accent);
-            if (glowImage_.isValid())
-                g.drawImageAt (glowImage_,
-                               (getWidth()  - glowImage_.getWidth())  / 2,
-                               (getHeight() - glowImage_.getHeight()) / 2);
-        }
-
-        auto textColour = on ? juce::Colour (0xfffffff8)
-                             : (shouldDrawButtonAsHighlighted ? CrunchPalette::text (isLightTheme())
-                                                              : CrunchPalette::textDim (isLightTheme()));
-        if (on && shouldDrawButtonAsDown)
-            textColour = textColour.brighter (0.3f);
-
-        g.setFont (CrunchLookAndFeel::uiFont (14.0f, 600));
-        g.setColour (textColour);
-        g.drawText (kText, bounds.toNearestInt(), juce::Justification::centred, false);
-    }
-
-private:
-    juce::Colour accentColour() const
-    {
-        if (auto* laf = dynamic_cast<CrunchLookAndFeel*> (&getLookAndFeel()))
-            return laf->getAccentColour();
-        return juce::Colour (0xffe07856);
-    }
-
-    bool isLightTheme() const
-    {
-        if (auto* laf = dynamic_cast<CrunchLookAndFeel*> (&getLookAndFeel()))
-            return laf->isLightTheme();
-        return true;
-    }
-
-    juce::Font textFont()
-    {
-        return CrunchLookAndFeel::uiFont (13.5f, 600);
-    }
-
-    void rebuildGlowIfNeeded (juce::Colour accent)
-    {
-        if (glowValid_ && glowColour_ == accent && glowW_ == getWidth() && glowH_ == getHeight())
-            return;
-
-        glowValid_  = true;
-        glowW_      = getWidth();
-        glowH_      = getHeight();
-        glowColour_ = accent;
-        glowImage_  = {};
-
-        const int w = glowW_ + glowPad_ * 2;
-        const int h = glowH_ + glowPad_ * 2;
-        if (w <= 0 || h <= 0)
-            return;
-
-        juce::Image glow (juce::Image::ARGB, w, h, true);
-        {
-            juce::Graphics gi (glow);
-            gi.setFont (textFont());
-            gi.setColour (accent);
-            gi.drawText (kText, glowPad_, glowPad_, glowW_, glowH_,
-                         juce::Justification::centred, false);
-        }
-
-        juce::ImageConvolutionKernel kernel (glowRadius_ * 2 + 1);
-        kernel.createGaussianBlur ((float) glowRadius_);
-        kernel.applyToImage (glow, glow, glow.getBounds());
-        glowImage_ = glow;
-    }
-
-    static constexpr const char* kText = "AUTO GAIN";
-    static constexpr int glowPad_    = 9;
-    static constexpr int glowRadius_ = 3;
-
-    juce::Image  glowImage_;
-    juce::Colour glowColour_ {};
-    int  glowW_ = -1;
-    int  glowH_ = -1;
-    bool glowValid_ = false;
-};
-
-// Bottom panel (240 px, two zones):
+// ============================================================
+// BandControlPanel — Crunch Compressor 路线 A 单层三舱主控台 + 底部 4 格全局胶囊参数条
 //
-//   +---------------------------------------------+---------------------------+
-//   | STYLE                          (label above)| Threshold  Ratio  Attack  | Release   Bypass
-//   | [Color Mode][Position]                     |  (main knobs, accent labels,|
-//   | Amount                                     |   larger than the strip)  |
-//   | ---------                                   |                           |
-//   | KNEE                                        | In        Mix        Out   | AUTO GAIN
-//   | [Hard/Soft]                                 |  (bottom knob strip)       |
-//   | DETECTOR                                    |                           |
-//   | [Peak/RMS]                                  |                           |
-//   | LOOKAHEAD                                   |                           |
-//   | [Off/1 ms/3 ms]                             |                           |
-//   +---------------------------------------------+---------------------------+
-//
-// Every selector / button carries a caption above it so its function is
-// obvious. The colour (STYLE) module sits on the left, aligned with the
-// selector column, with its own module label ("STYLE") above.
+//   · 上层路线 A 三舱：
+//       1. 左舱 COLOUR   : 标题 + [Pre|Post] 滑块 + [HQ] 4x 抗混叠微发光开关 + AMOUNT 旋钮 + [Warm|Cold|Clip] 滑块
+//       2. 中舱 DYNAMICS : 左栈双滑块（[Hard|Soft] 拐点 + [Peak|RMS] 检测器）+ 四大主旋钮（THRESHOLD 同轨电平弧 / RATIO / ATTACK / RELEASE）
+//       3. 右舱 I/O·MIX  : INPUT / MIX / OUTPUT 三颗旋钮 + OUTPUT 正下方 [AUTO] 自动增益幽灵微徽章
+//   · 下层全局条（Global Bar）：
+//       单行 4 个自适应胶囊：LOOKAHEAD / CURVE / COLOUR HQ / BYPASS
+// ============================================================
 class BandControlPanel : public juce::Component,
                          public juce::AudioProcessorValueTreeState::Listener
 {
@@ -130,33 +30,119 @@ public:
     explicit BandControlPanel (CrunchCompressorAudioProcessor& processor);
     ~BandControlPanel() override;
 
+    void paint (juce::Graphics&) override;
     void resized() override;
-    void lookAndFeelChanged() override;
+
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+
+    void applyUiSnapshot (const UiPack::UiSnapshot& snap);
+    void syncFromProcessor (bool snapSlides = false);
+
+    void tickKnobs (double nowMs);
+    bool isKnobAnimating() const noexcept;
+
     void parameterChanged (const juce::String& parameterID, float newValue) override;
 
+    std::function<void (const juce::String& tag,
+                        juce::Rectangle<float> anchorInPanel,
+                        const juce::StringArray& items,
+                        int currentIndex,
+                        bool useTranslatedFont,
+                        std::function<void (int)> onSelect)> onRequestPopup;
+    std::function<void()>     onGlobalStateChanged;
+    std::function<void (bool)> onThresholdFocusChanged;
+
 private:
-    void setupKnob (juce::Slider& slider, juce::Label& label, const juce::String& title, const juce::String& suffix);
-    void setupCombo (juce::ComboBox& box, juce::Label& label, const juce::String& title);
-    void applyThemeColours();
+    EditorLayout makeLayout() const;
+    EditorLayout::BottomSlots slots() const;
+
+    struct StageGeometry
+    {
+        juce::Rectangle<float> leftStack;
+        juce::Rectangle<float> heroCluster;
+        float heroCellW = 100.0f;
+        float heroDiam  = 58.0f;
+    };
+    StageGeometry computeStageGeometry (const juce::Rectangle<float>& cd, float s) const noexcept;
+
+    // 左舱 COLOUR 矩形
+    juce::Rectangle<float> colorPosTrayRect  (const juce::Rectangle<float>& deck, float s) const;
+    juce::Rectangle<float> colorPosCellRect  (const juce::Rectangle<float>& deck, float s, int idx) const;
+    juce::Rectangle<float> colorHqBtnRect    (const juce::Rectangle<float>& deck, float s) const;
+    juce::Rectangle<float> colorModeTrayRect (const juce::Rectangle<float>& deck, float s) const;
+    juce::Rectangle<float> colorModeCellRect (const juce::Rectangle<float>& deck, float s, int idx) const;
+
+    // 中舱左控制栈（Knee & Detector 双滑块）矩形
+    juce::Rectangle<float> kneeTrayRect      (const juce::Rectangle<float>& ls, float s) const;
+    juce::Rectangle<float> kneeCellRect      (const juce::Rectangle<float>& ls, float s, int idx) const;
+    juce::Rectangle<float> detectorTrayRect  (const juce::Rectangle<float>& ls, float s) const;
+    juce::Rectangle<float> detectorCellRect  (const juce::Rectangle<float>& ls, float s, int idx) const;
+
+    // 右舱 I/O·MIX 矩形
+    juce::Rectangle<float> autoGainBtnRect   (const juce::Rectangle<float>& deck, float s) const;
+
+    int hitTestHoverId (juce::Point<float> p) const;
+
+    float getFloatParam  (const juce::String& id) const;
+    int   getChoiceParam (const juce::String& id) const;
+    void  setFloatParam  (const juce::String& id, float value);
+    void  setChoiceParam (const juce::String& id, int index);
+    void  beginGesture   (const juce::String& id);
+    void  endGesture     (const juce::String& id);
+
+    void layoutKnobs();
+
+    void updateColorPosSlide  (int newIdx, bool snap);
+    void updateColorModeSlide (int newMode, bool snap);
+    void updateKneeSlide      (int newIdx, bool snap);
+    void updateDetectorSlide  (int newIdx, bool snap);
 
     CrunchCompressorAudioProcessor& processor_;
+    UiPack::UiSnapshot snap_ = UiPack::UiComposition().snapshot();
 
-    juce::Slider thresholdSlider_, ratioSlider_, attackSlider_, releaseSlider_;
-    juce::Slider inSlider_, mixSlider_, outSlider_, colorAmountSlider_;
-    juce::Label  thresholdLabel_, ratioLabel_, attackLabel_, releaseLabel_;
-    juce::Label  inLabel_, mixLabel_, outLabel_, colorAmountLabel_;
-    juce::ComboBox kneeBox_, detectorBox_, lookaheadBox_;
-    juce::Label  kneeLabel_, detectorLabel_, lookaheadLabel_;
-    juce::ComboBox colorModeBox_, colorPositionBox_;
-    juce::TextButton bypassButton_;
-    AutoGainButton   autoGainButton_;
-    juce::Label colorSectionLabel_;
+    // 8 颗自绘四态旋钮
+    Knob colorAmountKnob_;
+    Knob thresholdKnob_;
+    Knob ratioKnob_;
+    Knob attackKnob_;
+    Knob releaseKnob_;
+    Knob inKnob_;
+    Knob mixKnob_;
+    Knob outKnob_;
 
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>   thresholdAtt_, ratioAtt_, attackAtt_, releaseAtt_;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>   inAtt_, mixAtt_, outAtt_, colorAmountAtt_;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> kneeAtt_, detectorAtt_, lookaheadAtt_;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> colorModeAtt_, colorPositionAtt_;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>   autoGainAtt_;
+    // 4 组 cubic-bezier(0.22, 1, 0.36, 1) 分段滑动高光胶囊
+    Tween colorPosSlideTween_;
+    int   colorPosSlideFromIdx_  = 1;
+    int   colorPosSlideToIdx_    = 1;
+
+    Tween colorModeSlideTween_;
+    int   colorModeSlideFromIdx_ = -1;
+    int   colorModeSlideToIdx_   = -1;
+
+    Tween kneeSlideTween_;
+    int   kneeSlideFromIdx_      = 1;
+    int   kneeSlideToIdx_        = 1;
+
+    Tween detSlideTween_;
+    int   detSlideFromIdx_       = 0;
+    int   detSlideToIdx_         = 0;
+
+    bool  segMoving_     = false;
+    int   lastHoveredId_ = -1;
+    bool  syncingKnobs_  = false;
+
+    // 新拟物三舱静态底座单图缓存 + 60Hz 原子脏标记合并
+    juce::Image       deckBackdropCache_;
+    juce::uint32      deckBackdropRev_ = 0;
+    int               deckBackdropW_   = 0;
+    int               deckBackdropH_   = 0;
+    std::atomic<bool> paramDirty_ { false };
+
+    std::array<float, EditorLayout::kNumGlobalCells> globalLabelWidths_ {};
+    float globalLabelScale_  = 0.0f;
+    int   globalLabelLocale_ = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BandControlPanel)
 };

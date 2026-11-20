@@ -2,6 +2,8 @@
 
 #include <JuceHeader.h>
 
+#include <array>
+#include <atomic>
 #include <vector>
 
 #include "dsp/Compressor.h"
@@ -26,6 +28,7 @@ public:
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 0.0; }
+    juce::VST3ClientExtensions* getVST3ClientExtensions() override { return &vst3Extensions_; }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -38,109 +41,139 @@ public:
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
 
-    // --- display API (safe to poll from the UI thread) ----------------------
+    // --- display & live telemetry API (lock-free, safe to poll from UI thread) ---
 
-    // Copies the most recent numPoints history entries (oldest first) into the
-    // caller-provided buffers. One point is recorded every ~0.5 ms; the ring
-    // holds ~16 s. Returns the number of points written (<= numPoints).
-    // If counterOut is non-null it receives the SAME ring counter value the
-    // copy was based on, so the UI can align its scroll position to the data
-    // exactly instead of re-reading a (possibly newer) counter afterwards.
     int readHistory (int numPoints, float* inDb, float* outDb, float* grDb,
                      unsigned* counterOut = nullptr) const noexcept;
 
-    // Ring write counter (history points recorded since prepareToPlay). The
-    // UI polls it to know how far the newest data has advanced, so it can
-    // render the scroll at a steady rate instead of stepping with the host's
-    // irregular message-loop ticks.
     unsigned getHistoryCounter() const noexcept
     {
         return (unsigned) historyCounter_.load (std::memory_order_acquire);
     }
 
-    // Static input->output transfer curve (dB) for the current parameters:
-    // inDb[i] is linearly spaced from minDb to maxDb, outDb[i] = inDb[i] +
-    // applied gain (incl. auto-gain makeup).
     void getTransferCurve (float minDb, float maxDb, int points,
                            std::vector<float>& inDb, std::vector<float>& outDb) const;
 
-    float getInputPeakDb() const noexcept  { return inputPeakDb_.load(); }
-    float getOutputPeakDb() const noexcept { return outputPeakDb_.load(); }
-    float getGainReductionDb() const noexcept { return gainReduction_.load(); }
+    float getInputPeakDb() const noexcept     { return inputPeakDb_.load (std::memory_order_relaxed); }
+    float getOutputPeakDb() const noexcept    { return outputPeakDb_.load (std::memory_order_relaxed); }
+    float getGainReductionDb() const noexcept { return gainReduction_.load (std::memory_order_relaxed); }
+    float getDetectorLevelDb() const noexcept { return detectorLevelDb_.load (std::memory_order_relaxed); }
 
-    int getTheme() const noexcept { return theme_.load(); }
-    void setTheme (int theme) { theme_.store (juce::jlimit (0, 2, theme)); }
+    // ---------- 四包 UI 组合持久化（默认：Classic + Blue + Standard + EnUS） ----------
+    struct UiPackSettings
+    {
+        int themeId   = 0;   // 0=Classic, 1=Neumorphism
+        int paletteId = 0;   // 0=Blue, 1=Red, 2=Cream, 3=NeuLight, 4=NeuTeal, 5=NeuDark
+        int layoutId  = 0;   // 0=Standard, 1=Sculpted
+        int localeId  = 0;   // 0=en-US, 1=zh-CN
+    };
+    const UiPackSettings& getUiPackSettings() const noexcept { return uiPackSettings_; }
+    void setUiPackSettings (const UiPackSettings& s, bool persistGlobal = true) noexcept;
+    static juce::File globalUiPrefsFile();
+    void loadGlobalUiPrefs() noexcept;
+    void saveGlobalUiPrefs() const noexcept;
+
+    // 兼容旧接口
+    int getTheme() const noexcept { return uiPackSettings_.paletteId; }
+    void setTheme (int paletteIdx) noexcept;
     juce::Colour getThemeAccent() const;
-    bool isLightTheme() const noexcept { return theme_.load() == 2; }
+    bool isLightTheme() const noexcept;
 
-    // True while the editor window is being dragged or resized. Hosts that
-    // move the plugin editor as its own top-level window (FL Studio) send a
-    // window-position change per mouse sample, each of which invalidates the
-    // whole window; combined with the display's own 60 Hz repaints that
-    // saturates the message loop and shows up as stutter and smearing while
-    // dragging. The display suspends its animation repaints while this is set.
-    bool isWindowDragging() const noexcept { return windowDragging_.load(); }
-    void setWindowDragging (bool dragging) noexcept { windowDragging_.store (dragging); }
+    // ---------- 全局旁通（桥接 Param::enabled）+ Colour [HQ] 4x 母带抗混叠 + Knee 曲线显隐 ----------
+    bool isPluginBypassed() const noexcept;
+    void setPluginBypassed (bool bypassed);
 
-    int getEditorWidth() const noexcept  { return editorWidth_.load(); }
-    int getEditorHeight() const noexcept { return editorHeight_.load(); }
-    void setEditorSize (int w, int h)    { editorWidth_.store (w); editorHeight_.store (h); }
+    bool isColorHqEnabled() const noexcept { return colorHqEnabled_.load (std::memory_order_relaxed); }
+    void setColorHqEnabled (bool enable) noexcept { colorHqEnabled_.store (enable, std::memory_order_relaxed); }
+    int  getColorLatencySamples() const noexcept { return color_.getLatencySamples(); }
+
+    bool isKneeCurveVisible() const noexcept { return kneeCurveVisible_.load (std::memory_order_relaxed); }
+    void setKneeCurveVisible (bool visible) noexcept { kneeCurveVisible_.store (visible, std::memory_order_relaxed); }
+
+    // ---------- 顶栏预设系统（4 分类 × 3 预设 = 12 项二级菜单预设）与 A/B 状态对比 ----------
+    static constexpr int kNumPresetCategories = 4;
+    static constexpr int kPresetsPerCategory  = 3;
+    static constexpr int kNumFactoryPresets   = kNumPresetCategories * kPresetsPerCategory;
+
+    int  getCurrentPresetIndex() const noexcept { return currentPresetIndex_; }
+    void applyFactoryPreset (int index);
+
+    bool isAbSlotB() const noexcept { return activeAbSlot_ == 1; }
+    void toggleAbSlot();
+    void setAbSlot (bool useSlotB);
+
+    // ---------- 宿主窗口拖动/缩放模态避让 ----------
+    bool isWindowDragging() const noexcept { return windowDragging_.load (std::memory_order_relaxed); }
+    void setWindowDragging (bool dragging) noexcept { windowDragging_.store (dragging, std::memory_order_relaxed); }
+
+    int getEditorWidth() const noexcept  { return editorWidth_.load (std::memory_order_relaxed); }
+    int getEditorHeight() const noexcept { return editorHeight_.load (std::memory_order_relaxed); }
+    void setEditorSize (int w, int h) noexcept
+    {
+        editorWidth_.store (w, std::memory_order_relaxed);
+        editorHeight_.store (h, std::memory_order_relaxed);
+    }
 
     juce::AudioProcessorValueTreeState apvts;
 
 private:
     void updateParameters();
 
-    Compressor compressor_;
+    struct LegacyVst3Extensions final : public juce::VST3ClientExtensions
+    {
+        std::vector<juce::String> getCompatibleClasses() const override
+        {
+            return { "56535443434D506372756E636820636F" };
+        }
+    };
+    LegacyVst3Extensions vst3Extensions_;
+
+    Compressor     compressor_;
     ColorProcessor color_;
 
-    // Level history ring (audio thread writes, UI thread reads): pre-allocated
-    // in prepareToPlay, lock-free via an atomic write counter.
-    static constexpr int kHistoryCapacity = 32768;   // ~16 s at 0.5 ms per point
-
-    // Level recorded for the pre-roll the ring is seeded with in
-    // prepareToPlay, so the display opens as a full flat line at the bottom
-    // of the graph (silence) rather than filling up from the right.
-    static constexpr float kIdleLevelDb = -100.0f;
+    static constexpr int   kHistoryCapacity = 32768;   // ~16 s at 0.5 ms per point
+    static constexpr float kIdleLevelDb     = -100.0f;
     std::vector<float> histIn_, histOut_, histGr_;
-    std::atomic<int> historyCounter_ { 0 };
-    int historyStride_ = 24;             // samples between history points
+    std::atomic<int>   historyCounter_ { 0 };
+    int historyStride_        = 24;
     int historySampleCounter_ = 0;
 
-    // Display envelopes: the raw level samples run at 2 kHz (waveform-rate),
-    // which makes a per-column decimated graph "boil" while scrolling. The
-    // graph records a ~4 ms envelope of the input/output levels instead, so
-    // the scrolling animation is stable; meters keep using the block peaks.
-    float displayInEnvDb_ = -100.0f;
+    float displayInEnvDb_  = -100.0f;
     float displayOutEnvDb_ = -100.0f;
-    float displayCoeff_ = 0.0f;
+    float displayCoeff_    = 0.0f;
 
-    std::atomic<float> inputPeakDb_ { -100.0f };
-    std::atomic<float> outputPeakDb_ { -100.0f };
-    std::atomic<float> gainReduction_ { 0.0f };
-    std::atomic<int> theme_ { 0 };
-    std::atomic<bool> windowDragging_ { false };
-    std::atomic<int> editorWidth_ { 0 };
-    std::atomic<int> editorHeight_ { 0 };
+    std::atomic<float> inputPeakDb_      { -100.0f };
+    std::atomic<float> outputPeakDb_     { -100.0f };
+    std::atomic<float> gainReduction_    { 0.0f };
+    std::atomic<float> detectorLevelDb_  { -100.0f };
+    std::atomic<bool>  colorHqEnabled_   { false };
+    std::atomic<bool>  kneeCurveVisible_ { true };
+    std::atomic<bool>  windowDragging_   { false };
+    std::atomic<int>   editorWidth_      { 0 };
+    std::atomic<int>   editorHeight_     { 0 };
 
-    // Typed parameter views. IMPORTANT: AudioProcessorValueTreeState raw
-    // values are NORMALISED (0..1) and must never be fed to the DSP as
-    // dB/ms/ratio/index values; always read the denormalised value here.
-    juce::AudioParameterBool*    enabledParam_ = nullptr;
-    juce::AudioParameterFloat*   inputGainParam_ = nullptr;
-    juce::AudioParameterFloat*   outputGainParam_ = nullptr;
-    juce::AudioParameterFloat*   thresholdParam_ = nullptr;
-    juce::AudioParameterFloat*   ratioParam_ = nullptr;
-    juce::AudioParameterFloat*   attackParam_ = nullptr;
-    juce::AudioParameterFloat*   releaseParam_ = nullptr;
-    juce::AudioParameterChoice*  kneeParam_ = nullptr;
-    juce::AudioParameterChoice*  detectorParam_ = nullptr;
-    juce::AudioParameterChoice*  lookaheadParam_ = nullptr;
-    juce::AudioParameterChoice*  autoGainParam_ = nullptr;
-    juce::AudioParameterChoice*  colorModeParam_ = nullptr;
-    juce::AudioParameterFloat*   colorAmountParam_ = nullptr;
-    juce::AudioParameterChoice*  colorPositionParam_ = nullptr;
-    juce::AudioParameterFloat*   mixParam_ = nullptr;
+    UiPackSettings uiPackSettings_;
+    int currentPresetIndex_ = 0;
+    int activeAbSlot_       = 0;
+    std::array<juce::ValueTree, 2> abSlotState_;
+    std::array<bool, 2>            abSlotColorHq_     { false, false };
+    std::array<bool, 2>            abSlotInitialized_ { false, false };
+
+    juce::AudioParameterBool*   enabledParam_       = nullptr;
+    juce::AudioParameterFloat*  inputGainParam_     = nullptr;
+    juce::AudioParameterFloat*  outputGainParam_    = nullptr;
+    juce::AudioParameterFloat*  thresholdParam_     = nullptr;
+    juce::AudioParameterFloat*  ratioParam_         = nullptr;
+    juce::AudioParameterFloat*  attackParam_        = nullptr;
+    juce::AudioParameterFloat*  releaseParam_       = nullptr;
+    juce::AudioParameterChoice* kneeParam_          = nullptr;
+    juce::AudioParameterChoice* detectorParam_      = nullptr;
+    juce::AudioParameterChoice* lookaheadParam_     = nullptr;
+    juce::AudioParameterChoice* autoGainParam_      = nullptr;
+    juce::AudioParameterChoice* colorModeParam_     = nullptr;
+    juce::AudioParameterFloat*  colorAmountParam_   = nullptr;
+    juce::AudioParameterChoice* colorPositionParam_ = nullptr;
+    juce::AudioParameterFloat*  mixParam_           = nullptr;
 
     float cachedInGain_ = 0.0f, cachedOutGain_ = 0.0f;
     float cachedThreshold_ = 0.0f, cachedRatio_ = 0.0f;
@@ -148,13 +181,11 @@ private:
     float cachedKnee_ = -1.0f, cachedDetector_ = -1.0f;
     float cachedLookahead_ = -1.0f, cachedAutoGain_ = -1.0f, cachedEnabled_ = -1.0f;
     float cachedColorMode_ = -1.0f, cachedColorAmount_ = -1.0f;
-    float cachedMix_ = Param::kMixDefault;
-    bool cacheValid_ = false;
+    bool  cachedColorHq_   = false;
+    float cachedMix_       = Param::kMixDefault;
+    bool  cacheValid_      = false;
 
-    // Dry/wet mix: the target comes from the parameter (cachedMix_ = 0..1);
-    // mixSmoothed_ is a ~10 ms smoothed version applied per sample, so host
-    // automation / knob drags do not produce zipper noise at the crossfade.
-    float mixSmoothed_ = 1.0f;
+    float mixSmoothed_    = 1.0f;
     float mixSmoothCoeff_ = 0.0f;
 
     int reportedLatency_ = -1;

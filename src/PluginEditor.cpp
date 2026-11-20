@@ -7,18 +7,70 @@ CrunchCompressorAudioProcessorEditor::CrunchCompressorAudioProcessorEditor (Crun
       panel_ (p)
 {
     setLookAndFeel (&lookAndFeel_);
-    lookAndFeel_.setTheme (processor_.getTheme());
+    CompTheme::setTextScale (CompTheme::kUiTextScale);
 
     addAndMakeVisible (display_);
     addAndMakeVisible (panel_);
+    addChildComponent (popupOverlay_);
 
+    panel_.onGlobalStateChanged = [this]
+    {
+        display_.parametersChanged();
+        display_.ensureTimerFullRate();
+        display_.repaint();
+    };
+
+    panel_.onThresholdFocusChanged = [this] (bool active)
+    {
+        display_.setThresholdGuideActive (active);
+    };
+
+    display_.onTickKnobs = [this] (double nowMs)
+    {
+        panel_.tickKnobs (nowMs);
+    };
+
+    display_.isExternalAnimating = [this]
+    {
+        return panel_.isKnobAnimating();
+    };
+
+    display_.onCompositionChanged = [this]
+    {
+        applySnapshotToAll();
+    };
+
+    display_.onPresetApplied = [this]
+    {
+        panel_.syncFromProcessor (false);
+        panel_.repaint();
+        display_.parametersChanged();
+        display_.ensureTimerFullRate();
+    };
+
+    panel_.onRequestPopup = [this] (const juce::String& tag,
+                                    juce::Rectangle<float> anchorInPanel,
+                                    const juce::StringArray& items,
+                                    int currentIndex,
+                                    bool useTranslatedFont,
+                                    std::function<void (int)> onSelect)
+    {
+        const auto anchorInEditor = anchorInPanel.translated ((float) panel_.getX(), (float) panel_.getY());
+        popupOverlay_.open (tag, anchorInEditor, items, currentIndex, useTranslatedFont,
+                            std::move (onSelect),
+                            [this] { display_.repaint(); panel_.repaint(); });
+    };
+
+    // 先 setSize，再 setResizable + setResizeLimits，确保右下角缩放手柄 z-order 正确
     const int savedW = processor_.getEditorWidth();
     const int savedH = processor_.getEditorHeight();
-    setSize (savedW > 0 ? savedW : 920, savedH > 0 ? savedH : 620);
+    const int initW  = (savedW >= EditorLayout::minWidth  && savedW <= EditorLayout::maxWidth)  ? savedW : EditorLayout::defaultWidth;
+    const int initH  = (savedH >= EditorLayout::minHeight && savedH <= EditorLayout::maxHeight) ? savedH : EditorLayout::defaultHeight;
+    setSize (initW, initH);
     setResizable (true, true);
-    setResizeLimits (700, 500, 1840, 1240);
+    setResizeLimits (EditorLayout::minWidth, EditorLayout::minHeight, EditorLayout::maxWidth, EditorLayout::maxHeight);
 
-    sendLookAndFeelChange();
+    applySnapshotToAll();
 
     for (auto* param : processor_.getParameters())
     {
@@ -26,25 +78,13 @@ CrunchCompressorAudioProcessorEditor::CrunchCompressorAudioProcessorEditor (Crun
             processor_.apvts.addParameterListener (idp->paramID, this);
     }
 
-    // Theme changes must repaint every component: JUCE buttons/combos do not
-    // reliably repaint on lookAndFeelChanged(), so panels would keep stale
-    // (e.g. black-on-white-theme) colours.
-    display_.onThemeChanged = [this]
-    {
-        sendLookAndFeelChange();
-        display_.repaint();
-        panel_.repaint();
-        repaint();
-    };
-
-    // The peer may already exist (standalone / some hosts); otherwise
-    // parentHierarchyChanged() applies this once the host attaches the editor.
     forceSoftwareRenderer();
 }
 
 CrunchCompressorAudioProcessorEditor::~CrunchCompressorAudioProcessorEditor()
 {
     stopTimer();
+    processor_.setWindowDragging (false);
 
     for (auto* param : processor_.getParameters())
     {
@@ -55,27 +95,48 @@ CrunchCompressorAudioProcessorEditor::~CrunchCompressorAudioProcessorEditor()
     setLookAndFeel (nullptr);
 }
 
+void CrunchCompressorAudioProcessorEditor::applySnapshotToAll()
+{
+    const auto& snap = display_.getUiSnapshot();
+    const EditorLayout lay (getLocalBounds(), snap.layout);
+
+    lookAndFeel_.setUiScale (lay.scale);
+    lookAndFeel_.applyUiSnapshot (snap);
+    panel_.applyUiSnapshot (snap);
+    popupOverlay_.applyUiSnapshot (snap);
+    popupOverlay_.close();
+
+    layoutComponents();
+    sendLookAndFeelChange();
+    display_.repaint();
+    panel_.repaint();
+    repaint();
+}
+
+void CrunchCompressorAudioProcessorEditor::layoutComponents()
+{
+    const auto& snap = display_.getUiSnapshot();
+    const EditorLayout lay (getLocalBounds(), snap.layout);
+
+    lookAndFeel_.setUiScale (lay.scale);
+    display_.setBounds (lay.displayViewBounds());
+    panel_.setBounds   (lay.bottomPanelBounds());
+    popupOverlay_.setBounds (getLocalBounds());
+}
+
 void CrunchCompressorAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    g.fillAll (CrunchPalette::background (lookAndFeel_.isLightTheme()));
+    g.fillAll (display_.getUiSnapshot().palette.bg);
 }
 
 void CrunchCompressorAudioProcessorEditor::resized()
 {
     processor_.setEditorSize (getWidth(), getHeight());
-
-    // A resize drag also runs a modal loop that invalidates the window per
-    // step, so the display should stand down for it exactly like a move.
     noteWindowMove();
-
-    auto area = getLocalBounds();
-    panel_.setBounds (area.removeFromBottom (280));
-    display_.setBounds (area);
+    popupOverlay_.close();
+    layoutComponents();
 }
 
-// JUCE calls this for every window-position change (WM_WINDOWPOSCHANGED ->
-// handleMovedOrResized -> sendMovedResizedMessages), i.e. once per mouse
-// sample while the user drags the editor window.
 void CrunchCompressorAudioProcessorEditor::moved()
 {
     noteWindowMove();
@@ -83,25 +144,24 @@ void CrunchCompressorAudioProcessorEditor::moved()
 
 void CrunchCompressorAudioProcessorEditor::noteWindowMove()
 {
+    if (! isShowing())
+        return;
     processor_.setWindowDragging (true);
     lastMoveMs_ = juce::Time::getMillisecondCounter();
-    startTimer (50);   // watches for the end of the drag loop
+    startTimer (50);
 }
 
 void CrunchCompressorAudioProcessorEditor::timerCallback()
 {
-    // No move event for a while: the drag loop has finished, so the display
-    // may animate again. The very next display tick repaints everything.
     if (juce::Time::getMillisecondCounter() - lastMoveMs_ >= 150)
     {
         processor_.setWindowDragging (false);
         stopTimer();
+        display_.repaint();
+        panel_.repaint();
     }
 }
 
-// Called when the host attaches (or re-attaches) the editor, i.e. exactly when
-// the native peer becomes available. Switching the rendering engine is
-// idempotent, so calling it from here and from the constructor is safe.
 void CrunchCompressorAudioProcessorEditor::parentHierarchyChanged()
 {
     forceSoftwareRenderer();
@@ -113,8 +173,8 @@ void CrunchCompressorAudioProcessorEditor::forceSoftwareRenderer()
     if (peer == nullptr)
         return;
 
-    const auto engines = peer->getAvailableRenderingEngines();
-    const int software = engines.indexOf (juce::String ("Software Renderer"));
+    const auto engines  = peer->getAvailableRenderingEngines();
+    const int  software = engines.indexOf (juce::String ("Software Renderer"));
 
     if (software < 0 || peer->getCurrentRenderingEngine() == software)
         return;
@@ -125,9 +185,6 @@ void CrunchCompressorAudioProcessorEditor::forceSoftwareRenderer()
 
 void CrunchCompressorAudioProcessorEditor::parameterChanged (const juce::String&, float)
 {
-    // The static transfer curve depends on the parameters, so mark it stale
-    // instead of recomputing it on every repaint.
+    // 严格遵守 60fps 铁律：仅置无锁原子脏标记，绝不在参数回调线程直接调 repaint()
     display_.parametersChanged();
-    display_.repaint();
-    panel_.repaint();
 }
